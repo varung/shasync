@@ -1,0 +1,10 @@
+# compiled binary at the repo root
+/shasync
+
+# editor / OS scratch
+*.swp
+.DS_Store
+
+# test-time scratch (none expected, but in case)
+/tmp_test_*
+/myvcs
