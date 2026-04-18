@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
+	"io"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -183,4 +185,119 @@ func must(t *testing.T, err error) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+// --- Encryption round-trip on the S3 emulator. ---
+//
+// Verifies (1) the bucket objects are actually ciphertext (not plaintext), and
+// (2) a second machine with the same key can pull + decrypt + checkout.
+
+func TestEncryptedPushPullViaS3Emulator(t *testing.T) {
+	backend := s3mem.New()
+	faker := gofakes3.New(backend)
+	srv := httptest.NewServer(faker.Server())
+	t.Cleanup(srv.Close)
+	if err := backend.CreateBucket("shasync-test"); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("SHASYNC_S3_ENDPOINT", srv.URL)
+	t.Setenv("SHASYNC_S3_FORCE_PATH_STYLE", "1")
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	t.Setenv("AWS_REGION", "us-east-1")
+
+	ctx := context.Background()
+	remoteURL := "s3://shasync-test/encrypted-project"
+	const marker = "hello world\n" // appears verbatim in makeWorkTree's hello.txt
+
+	// --- Machine A ---
+	a := makeWorkTree(t)
+	chdir(t, a)
+	must(t, cmdInit())
+	must(t, cmdKey([]string{"gen"}))
+	must(t, cmdCommit([]string{"-m", "encrypted"}))
+	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdPush(ctx, nil))
+
+	sA, _ := findStore()
+	head, _ := sA.readHead()
+	keyA, err := os.ReadFile(sA.keyPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Assert stored objects don't contain plaintext.
+	objs, err := backend.ListBucket("shasync-test", nil, gofakes3.ListBucketPage{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objs.Contents) == 0 {
+		t.Fatal("expected uploaded objects, got none")
+	}
+	for _, o := range objs.Contents {
+		got, err := backend.GetObject("shasync-test", o.Key, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(got.Contents)
+		got.Contents.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(body) < cryptMagicLen || string(body[:cryptMagicLen]) != cryptMagic {
+			t.Fatalf("object %s is not shasync-encrypted: first bytes = %q", o.Key, body[:min(16, len(body))])
+		}
+		if bytesContains(body, []byte(marker)) {
+			t.Fatalf("object %s leaks plaintext marker %q", o.Key, marker)
+		}
+	}
+
+	// --- Machine B: same key, pull succeeds ---
+	b := t.TempDir()
+	chdir(t, b)
+	must(t, cmdInit())
+	sB, _ := findStore()
+	if err := os.WriteFile(sB.keyPath(), keyA, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdPull(ctx, []string{head}))
+	must(t, cmdCheckout([]string{head}))
+	if read(t, filepath.Join(b, "hello.txt")) != marker {
+		t.Fatalf("machine B did not recover plaintext")
+	}
+
+	// --- Machine C: wrong key, pull must fail ---
+	c := t.TempDir()
+	chdir(t, c)
+	must(t, cmdInit())
+	sC, _ := findStore()
+	wrong, _ := generateKey()
+	if err := os.WriteFile(sC.keyPath(), []byte(hex.EncodeToString(wrong)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	must(t, cmdRemote([]string{"set", remoteURL}))
+	if err := cmdPull(ctx, []string{head}); err == nil {
+		t.Fatal("expected pull with wrong key to fail")
+	}
+}
+
+func bytesContains(haystack, needle []byte) bool {
+	if len(needle) == 0 || len(haystack) < len(needle) {
+		return false
+	}
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		match := true
+		for j := range needle {
+			if haystack[i+j] != needle[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
 }

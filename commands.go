@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/hex"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -457,6 +460,46 @@ func cmdRemote(args []string) error {
 	}
 }
 
+// --- key ---
+
+func cmdKey(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: shasync key {gen|show}")
+	}
+	s, err := findStore()
+	if err != nil {
+		return err
+	}
+	switch args[0] {
+	case "gen":
+		if _, err := os.Stat(s.keyPath()); err == nil {
+			return fmt.Errorf("%s already exists — remove it explicitly if you mean to rotate (existing blobs will no longer decrypt)", s.keyPath())
+		}
+		k, err := generateKey()
+		if err != nil {
+			return err
+		}
+		if err := writeFileAtomic(s.keyPath(), []byte(hex.EncodeToString(k)+"\n"), 0o600); err != nil {
+			return err
+		}
+		fmt.Printf("wrote %s (chmod 600)\ncopy this file to other machines out-of-band — it is never sent to the remote\n", s.keyPath())
+		return nil
+	case "show":
+		k, err := s.loadKey()
+		if err != nil {
+			return err
+		}
+		if k == nil {
+			fmt.Println("(no key configured; push/pull are plaintext)")
+			return nil
+		}
+		fmt.Println(hex.EncodeToString(k))
+		return nil
+	default:
+		return fmt.Errorf("unknown: shasync key %s", args[0])
+	}
+}
+
 // --- push ---
 
 func cmdPush(ctx context.Context, args []string) error {
@@ -470,6 +513,10 @@ func cmdPush(ctx context.Context, args []string) error {
 	}
 	if c.Remote == "" {
 		return fmt.Errorf("no remote set — run: shasync remote set <url>")
+	}
+	cryptKey, err := s.loadKey()
+	if err != nil {
+		return err
 	}
 	r, err := newRemote(ctx, c.Remote)
 	if err != nil {
@@ -531,43 +578,16 @@ func cmdPush(ctx context.Context, args []string) error {
 	}
 	sort.Strings(blobList)
 	if err := parallelFor(ctx, 16, blobList, func(ctx context.Context, b string) error {
-		key := remoteBlobKey(b)
-		ok, err := r.Exists(ctx, key)
-		if err != nil {
-			return err
-		}
-		if ok {
-			return nil
-		}
-		f, err := os.Open(s.objectPath(b))
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-		return r.Upload(ctx, key, f)
+		return uploadLocalFile(ctx, r, cryptKey, s.objectPath(b), remoteBlobKey(b))
 	}); err != nil {
 		return err
 	}
 
 	// Upload manifests last so a remote-observer never sees a dangling manifest.
 	for _, mSha := range manifestsToPush {
-		key := remoteManifestKey(mSha)
-		ok, err := r.Exists(ctx, key)
-		if err != nil {
+		if err := uploadLocalFile(ctx, r, cryptKey, s.manifestPath(mSha), remoteManifestKey(mSha)); err != nil {
 			return err
 		}
-		if ok {
-			continue
-		}
-		f, err := os.Open(s.manifestPath(mSha))
-		if err != nil {
-			return err
-		}
-		if err := r.Upload(ctx, key, f); err != nil {
-			f.Close()
-			return err
-		}
-		f.Close()
 	}
 
 	fmt.Printf("pushed %s  (%d blobs, %d manifests)\n", sha, len(blobList), len(manifestsToPush))
@@ -592,6 +612,10 @@ func cmdPull(ctx context.Context, args []string) error {
 	if c.Remote == "" {
 		return fmt.Errorf("no remote set — run: shasync remote set <url>")
 	}
+	cryptKey, err := s.loadKey()
+	if err != nil {
+		return err
+	}
 	r, err := newRemote(ctx, c.Remote)
 	if err != nil {
 		return err
@@ -599,7 +623,7 @@ func cmdPull(ctx context.Context, args []string) error {
 
 	// Fetch manifest if missing.
 	if !s.hasManifest(target) {
-		if err := downloadManifest(ctx, r, s, target); err != nil {
+		if err := downloadManifest(ctx, r, s, cryptKey, target); err != nil {
 			return err
 		}
 	}
@@ -619,7 +643,7 @@ func cmdPull(ctx context.Context, args []string) error {
 		}
 		if m.ParentSHA != "" && !s.hasManifest(m.ParentSHA) {
 			// Best-effort: try to pull parents too so `log` works locally.
-			if err := downloadManifest(ctx, r, s, m.ParentSHA); err == nil {
+			if err := downloadManifest(ctx, r, s, cryptKey, m.ParentSHA); err == nil {
 				toVisit = append(toVisit, m.ParentSHA)
 			}
 		}
@@ -634,7 +658,7 @@ func cmdPull(ctx context.Context, args []string) error {
 	}
 	sort.Strings(need)
 	if err := parallelFor(ctx, 16, need, func(ctx context.Context, b string) error {
-		return downloadBlob(ctx, r, s, b)
+		return downloadBlob(ctx, r, s, cryptKey, b)
 	}); err != nil {
 		return err
 	}
@@ -643,28 +667,69 @@ func cmdPull(ctx context.Context, args []string) error {
 	return nil
 }
 
-func downloadManifest(ctx context.Context, r Remote, s *Store, sha string) error {
-	rc, err := r.Download(ctx, remoteManifestKey(sha))
-	if err != nil {
-		return err
-	}
-	defer rc.Close()
-	dst := s.manifestPath(sha)
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return err
-	}
-	return streamToFile(rc, dst, 0o444)
+func downloadManifest(ctx context.Context, r Remote, s *Store, cryptKey []byte, sha string) error {
+	return downloadAndStore(ctx, r, cryptKey, remoteManifestKey(sha), s.manifestPath(sha), sha)
 }
 
-func downloadBlob(ctx context.Context, r Remote, s *Store, sha string) error {
-	rc, err := r.Download(ctx, remoteBlobKey(sha))
+func downloadBlob(ctx context.Context, r Remote, s *Store, cryptKey []byte, sha string) error {
+	return downloadAndStore(ctx, r, cryptKey, remoteBlobKey(sha), s.objectPath(sha), sha)
+}
+
+// uploadLocalFile uploads localPath under remoteKey. If cryptKey != nil the
+// file contents are AES-256-GCM encrypted in memory before upload. Skips the
+// PUT if the remote key already exists.
+func uploadLocalFile(ctx context.Context, r Remote, cryptKey []byte, localPath, remoteKey string) error {
+	ok, err := r.Exists(ctx, remoteKey)
+	if err != nil {
+		return err
+	}
+	if ok {
+		return nil
+	}
+	f, err := os.Open(localPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if cryptKey == nil {
+		return r.Upload(ctx, remoteKey, f)
+	}
+	plaintext, err := io.ReadAll(f)
+	if err != nil {
+		return err
+	}
+	ct, err := encryptBytes(cryptKey, plaintext)
+	if err != nil {
+		return err
+	}
+	return r.Upload(ctx, remoteKey, bytes.NewReader(ct))
+}
+
+// downloadAndStore fetches remoteKey, optionally decrypts, verifies SHA
+// (when a key is in use — we already have the plaintext in memory), and
+// writes to dst atomically at mode 0444.
+func downloadAndStore(ctx context.Context, r Remote, cryptKey []byte, remoteKey, dst, sha string) error {
+	rc, err := r.Download(ctx, remoteKey)
 	if err != nil {
 		return err
 	}
 	defer rc.Close()
-	dst := s.objectPath(sha)
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
-	return streamToFile(rc, dst, 0o444)
+	if cryptKey == nil {
+		return streamToFile(rc, dst, 0o444)
+	}
+	ct, err := io.ReadAll(rc)
+	if err != nil {
+		return err
+	}
+	pt, err := decryptBytes(cryptKey, ct)
+	if err != nil {
+		return fmt.Errorf("%s: %w", remoteKey, err)
+	}
+	if err := verifyPlaintextSHA(pt, sha); err != nil {
+		return fmt.Errorf("%s: %w", remoteKey, err)
+	}
+	return writeFileAtomic(dst, pt, 0o444)
 }

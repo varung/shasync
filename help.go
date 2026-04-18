@@ -29,6 +29,8 @@ COMMANDS
   remote show                   print the configured remote
   push [<sha>]                  upload manifest + blobs to remote (default HEAD)
   pull <sha>                    download manifest + blobs from remote
+  key gen                       generate a repo encryption key at .blobs/key
+  key show                      print the configured encryption key (or "none")
   help <topic>                  show detailed help on a topic
 
 HELP TOPICS
@@ -37,6 +39,7 @@ HELP TOPICS
   gcs               using a Google Cloud Storage remote (including credentials)
   ssh               syncing two machines over SSH with rsync
   ignore            the .blobsignore file
+  encryption        encrypting blobs and manifests on the remote
 
 For a short command reference, run:  shasync --help
 For a deep dive on a topic, run:     shasync help <topic>
@@ -323,6 +326,57 @@ EXAMPLES
 The .blobs/ directory itself is always ignored automatically.
 `
 
+const encryptionHelp = `ENCRYPTION
+
+shasync can encrypt blobs and manifests client-side before uploading them
+to the remote. Objects in the bucket become opaque AES-256-GCM ciphertext;
+anyone who gains read access to the bucket (e.g. accidental public-read)
+cannot recover your files without the key.
+
+Threat model: protects against unintentional bucket exposure. It is NOT
+designed to resist an attacker who has both the ciphertext AND the key
+(any single-key scheme has this property).
+
+SETUP
+
+    cd my-project
+    shasync init
+    shasync key gen
+    shasync remote set s3://my-bucket/my-project
+    shasync push
+
+"key gen" writes .blobs/key (chmod 600) — a 32-byte AES-256 key encoded
+as hex. The key is NEVER sent to the remote.
+
+To sync a second machine, copy .blobs/key out-of-band (scp, password
+manager, etc) into the same path on the other machine, then pull as normal.
+
+ENV OVERRIDE
+
+Set SHASYNC_KEY to a hex-encoded 32-byte key to override the file:
+
+    export SHASYNC_KEY=$(shasync key show)   # copy-paste into ~/.zshrc on machine B
+
+CHANGING KEYS
+
+There is no in-place rotation. If .blobs/key is lost, already-pushed
+ciphertext cannot be decrypted. To rotate, start a fresh prefix
+(shasync remote set s3://bucket/new-prefix), shasync key gen, and push.
+
+WIRE FORMAT
+
+Each uploaded object is:
+    magic(5)="SHAS1" || nonce(12, random) || AES-256-GCM(plaintext) || tag(16)
+
+The remote key name is still blobs/<sha-of-plaintext> or
+manifests/<sha-of-plaintext>, so dedup across clients still works.
+
+MIXED MODE
+
+A single remote prefix should be either all-encrypted or all-plaintext.
+Pulling an encrypted object without a key (or vice versa) errors out.
+`
+
 var helpTopics = map[string]string{
 	"getting-started": gettingStartedHelp,
 	"quickstart":      gettingStartedHelp,
@@ -332,6 +386,9 @@ var helpTopics = map[string]string{
 	"rsync":           sshHelp,
 	"ignore":          ignoreHelp,
 	"blobsignore":     ignoreHelp,
+	"encryption":      encryptionHelp,
+	"encrypt":         encryptionHelp,
+	"key":             encryptionHelp,
 }
 
 func cmdHelp(args []string) error {
