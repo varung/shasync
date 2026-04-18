@@ -215,7 +215,7 @@ func TestEncryptedPushPullViaS3Emulator(t *testing.T) {
 	a := makeWorkTree(t)
 	chdir(t, a)
 	must(t, cmdInit())
-	must(t, cmdKey([]string{"gen"}))
+	must(t, cmdKey(ctx, []string{"gen"}))
 	must(t, cmdCommit([]string{"-m", "encrypted"}))
 	must(t, cmdRemote([]string{"set", remoteURL}))
 	must(t, cmdPush(ctx, nil))
@@ -245,8 +245,11 @@ func TestEncryptedPushPullViaS3Emulator(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(body) < cryptMagicLen || string(body[:cryptMagicLen]) != cryptMagic {
-			t.Fatalf("object %s is not shasync-encrypted: first bytes = %q", o.Key, body[:min(16, len(body))])
+		if o.Key == "encrypted-project/salt" {
+			continue // salt is stored plaintext by design
+		}
+		if len(body) < cryptMagicLen || string(body[:cryptMagicLen]) != cryptMagicV2 {
+			t.Fatalf("object %s is not shasync-v2-encrypted: first bytes = %q", o.Key, body[:min(16, len(body))])
 		}
 		if bytesContains(body, []byte(marker)) {
 			t.Fatalf("object %s leaks plaintext marker %q", o.Key, marker)
@@ -281,6 +284,113 @@ func TestEncryptedPushPullViaS3Emulator(t *testing.T) {
 	if err := cmdPull(ctx, []string{head}); err == nil {
 		t.Fatal("expected pull with wrong key to fail")
 	}
+}
+
+// --- Passphrase-derived key, end-to-end across two machines. ---
+
+func TestPassphraseRoundTripViaS3Emulator(t *testing.T) {
+	backend := s3mem.New()
+	faker := gofakes3.New(backend)
+	srv := httptest.NewServer(faker.Server())
+	t.Cleanup(srv.Close)
+	if err := backend.CreateBucket("shasync-test"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SHASYNC_S3_ENDPOINT", srv.URL)
+	t.Setenv("SHASYNC_S3_FORCE_PATH_STYLE", "1")
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	t.Setenv("AWS_REGION", "us-east-1")
+	t.Setenv("SHASYNC_PASSPHRASE", "correct horse battery staple")
+
+	ctx := context.Background()
+	remoteURL := "s3://shasync-test/passphrase-project"
+
+	// --- Machine A: init, remote, key from passphrase, commit, push ---
+	a := makeWorkTree(t)
+	chdir(t, a)
+	must(t, cmdInit())
+	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdKey(ctx, []string{"set-passphrase"}))
+	must(t, cmdCommit([]string{"-m", "passphrase commit"}))
+	must(t, cmdPush(ctx, nil))
+
+	sA, _ := findStore()
+	head, _ := sA.readHead()
+
+	// --- Machine B: same passphrase, no copied key file ---
+	b := t.TempDir()
+	chdir(t, b)
+	must(t, cmdInit())
+	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdKey(ctx, []string{"set-passphrase"}))
+	must(t, cmdPull(ctx, []string{head}))
+	must(t, cmdCheckout([]string{head}))
+
+	for _, rel := range []string{"hello.txt", "sub/a.txt", "sub/b.bin"} {
+		if read(t, filepath.Join(a, rel)) != read(t, filepath.Join(b, rel)) {
+			t.Fatalf("file %s differs after passphrase roundtrip", rel)
+		}
+	}
+
+	// --- Machine C: wrong passphrase → pull must fail ---
+	c := t.TempDir()
+	chdir(t, c)
+	must(t, cmdInit())
+	must(t, cmdRemote([]string{"set", remoteURL}))
+	t.Setenv("SHASYNC_PASSPHRASE", "wrong passphrase")
+	must(t, cmdKey(ctx, []string{"set-passphrase"}))
+	if err := cmdPull(ctx, []string{head}); err == nil {
+		t.Fatal("expected pull with wrong passphrase to fail")
+	}
+}
+
+// --- Chunked encryption: unit test for multi-chunk sizes. ---
+
+func TestChunkedEncryptionRoundTripAllSizes(t *testing.T) {
+	key, err := generateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, size := range []int{
+		0, 1, 16, 1024,
+		cryptChunkSize - 1,
+		cryptChunkSize,
+		cryptChunkSize + 1,
+		3 * cryptChunkSize,
+		3*cryptChunkSize + 7,
+	} {
+		pt := make([]byte, size)
+		for i := range pt {
+			pt[i] = byte(i * 131)
+		}
+		ct, err := encryptBytes(key, pt)
+		if err != nil {
+			t.Fatalf("size=%d: encrypt: %v", size, err)
+		}
+		if len(ct) >= cryptMagicLen && string(ct[:cryptMagicLen]) != cryptMagicV2 {
+			t.Fatalf("size=%d: wrong magic on ciphertext", size)
+		}
+		got, err := decryptBytes(key, ct)
+		if err != nil {
+			t.Fatalf("size=%d: decrypt: %v", size, err)
+		}
+		if !bytesEqual(got, pt) {
+			t.Fatalf("size=%d: roundtrip differs", size)
+		}
+	}
+}
+
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func bytesContains(haystack, needle []byte) bool {

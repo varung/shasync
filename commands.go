@@ -462,9 +462,9 @@ func cmdRemote(args []string) error {
 
 // --- key ---
 
-func cmdKey(args []string) error {
+func cmdKey(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: shasync key {gen|show}")
+		return fmt.Errorf("usage: shasync key {gen|set-passphrase|show}")
 	}
 	s, err := findStore()
 	if err != nil {
@@ -483,6 +483,53 @@ func cmdKey(args []string) error {
 			return err
 		}
 		fmt.Printf("wrote %s (chmod 600)\ncopy this file to other machines out-of-band — it is never sent to the remote\n", s.keyPath())
+		return nil
+	case "set-passphrase":
+		if _, err := os.Stat(s.keyPath()); err == nil {
+			return fmt.Errorf("%s already exists — remove it first if you mean to replace it", s.keyPath())
+		}
+		c, err := s.readConfig()
+		if err != nil {
+			return err
+		}
+		if c.Remote == "" {
+			return fmt.Errorf("configure a remote first (shasync remote set <url>) — the salt is stored in the bucket so all machines derive the same key")
+		}
+		r, err := newRemote(ctx, c.Remote)
+		if err != nil {
+			return err
+		}
+		salt, created, err := fetchOrCreateSalt(ctx, r)
+		if err != nil {
+			return err
+		}
+		if created {
+			fmt.Println("generated new salt and uploaded to remote")
+		} else {
+			fmt.Println("using existing salt from remote")
+		}
+		pass, err := readPassphrase("passphrase: ")
+		if err != nil {
+			return err
+		}
+		if len(pass) == 0 {
+			return fmt.Errorf("empty passphrase")
+		}
+		if os.Getenv("SHASYNC_PASSPHRASE") == "" {
+			confirm, err := readPassphrase("confirm:    ")
+			if err != nil {
+				return err
+			}
+			if !bytes.Equal(pass, confirm) {
+				return fmt.Errorf("passphrases do not match")
+			}
+		}
+		fmt.Println("deriving key via Argon2id (~100ms)...")
+		k := deriveKeyFromPassphrase(pass, salt)
+		if err := writeFileAtomic(s.keyPath(), []byte(hex.EncodeToString(k)+"\n"), 0o600); err != nil {
+			return err
+		}
+		fmt.Printf("wrote %s (chmod 600)\n", s.keyPath())
 		return nil
 	case "show":
 		k, err := s.loadKey()

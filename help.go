@@ -29,12 +29,14 @@ COMMANDS
   remote show                   print the configured remote
   push [<sha>]                  upload manifest + blobs to remote (default HEAD)
   pull <sha>                    download manifest + blobs from remote
-  key gen                       generate a repo encryption key at .blobs/key
+  key gen                       generate a random 32-byte repo encryption key
+  key set-passphrase            derive a key from a passphrase via Argon2id
   key show                      print the configured encryption key (or "none")
   help <topic>                  show detailed help on a topic
 
 HELP TOPICS
   getting-started   quickstart: init, commit, checkout, log
+  architecture      full system overview: layout, commands, data flow
   s3                using an S3 remote (including credentials)
   gcs               using a Google Cloud Storage remote (including credentials)
   ssh               syncing two machines over SSH with rsync
@@ -337,7 +339,7 @@ Threat model: protects against unintentional bucket exposure. It is NOT
 designed to resist an attacker who has both the ciphertext AND the key
 (any single-key scheme has this property).
 
-SETUP
+SETUP — RANDOM KEY
 
     cd my-project
     shasync init
@@ -351,25 +353,63 @@ as hex. The key is NEVER sent to the remote.
 To sync a second machine, copy .blobs/key out-of-band (scp, password
 manager, etc) into the same path on the other machine, then pull as normal.
 
-ENV OVERRIDE
+SETUP — PASSPHRASE (Argon2id)
 
-Set SHASYNC_KEY to a hex-encoded 32-byte key to override the file:
+If you'd rather memorise a passphrase than carry a key file:
 
-    export SHASYNC_KEY=$(shasync key show)   # copy-paste into ~/.zshrc on machine B
+    cd my-project
+    shasync init
+    shasync remote set s3://my-bucket/my-project
+    shasync key set-passphrase
+      passphrase: ****
+      confirm:    ****
+
+This generates a random 16-byte salt, uploads it to <prefix>/salt on the
+remote (plaintext — the salt is not secret), and runs:
+
+    key = Argon2id(passphrase, salt, time=3, memory=64 MiB, threads=4, 32 bytes)
+
+The derived key is cached locally in .blobs/key. On machine B you run the
+exact same command; it pulls the salt from the remote, derives the same
+key, and caches it.
+
+Choose a strong passphrase. An attacker with bucket read can grab the
+salt and run offline guesses (Argon2id slows them ~100ms per guess, but a
+weak passphrase like "password123" is still crackable). Aim for 4+
+diceware-style words.
+
+ENV OVERRIDES
+
+    export SHASYNC_KEY=<64-char hex>        # direct 32-byte key
+    export SHASYNC_PASSPHRASE=<string>      # used by "key set-passphrase"
 
 CHANGING KEYS
 
-There is no in-place rotation. If .blobs/key is lost, already-pushed
-ciphertext cannot be decrypted. To rotate, start a fresh prefix
-(shasync remote set s3://bucket/new-prefix), shasync key gen, and push.
+There is no in-place rotation. If the key or passphrase is lost, already-
+pushed ciphertext cannot be decrypted. To rotate, start a fresh prefix
+(shasync remote set s3://bucket/new-prefix), regenerate, and push.
 
-WIRE FORMAT
+WIRE FORMAT (v2, current)
 
-Each uploaded object is:
-    magic(5)="SHAS1" || nonce(12, random) || AES-256-GCM(plaintext) || tag(16)
+Each encrypted object is:
 
-The remote key name is still blobs/<sha-of-plaintext> or
+    [0..5)    magic "SHAS2"
+    [5..9)    chunk_size         uint32 BE  (default 65536)
+    [9..17)   plaintext_size     uint64 BE
+    [17..25)  nonce_prefix       8 random bytes
+    [25..)    chunks:
+                chunk i = AES-256-GCM(plaintext[i*chunk_size : (i+1)*chunk_size],
+                                      nonce = nonce_prefix || uint32_BE(i))
+
+Fixed-size chunks make HTTP range reads feasible: a browser that wants
+plaintext bytes [a, b) can fetch exactly the ciphertext chunks that
+cover that range, instead of downloading the whole blob.
+
+The remote object key is still blobs/<sha-of-plaintext> or
 manifests/<sha-of-plaintext>, so dedup across clients still works.
+
+v1 (older "SHAS1" whole-file format) is accepted on read for backwards
+compatibility but never written.
 
 MIXED MODE
 
@@ -377,9 +417,123 @@ A single remote prefix should be either all-encrypted or all-plaintext.
 Pulling an encrypted object without a key (or vice versa) errors out.
 `
 
+const architectureHelp = `ARCHITECTURE
+
+shasync is a content-addressed folder sync tool. Every snapshot is a
+manifest (a map of path → SHA-256 of file contents) plus a set of
+content-addressed blobs. Three layers: a local on-disk store, a remote
+blob store (S3 / GCS / rsync-over-SSH), and a thin command surface.
+
+COMMANDS
+
+  init                        create .blobs/ in the current directory
+  commit [-m <msg>]           snapshot the working tree; writes a new manifest
+  checkout <sha> [--force]    materialise manifest <sha> into the working tree
+  status                      show changes vs HEAD (path + size + mtime fast check)
+  log [-n <count>]            walk the manifest parent chain
+  head                        print the HEAD manifest SHA
+  remote set <url>            configure remote (gs://... or s3://...)
+  remote show                 print the configured remote
+  push [<sha>]                upload manifest chain + blobs to remote
+  pull <sha>                  download manifest chain + blobs from remote
+  key gen                     random 32-byte AES-256 key at .blobs/key
+  key set-passphrase          Argon2id-derived key from a memorable passphrase
+  key show                    print the currently loaded key (hex)
+  help <topic>                detailed topic docs
+
+LOCAL LAYOUT
+
+  <repo>/
+    <your files ...>
+    .blobsignore                  optional, gitignore-style patterns
+    .blobs/
+      HEAD                        current manifest SHA (64 hex chars + newline)
+      config.json                 { "remote": "s3://bucket/prefix" }
+      key                         hex-encoded 32-byte AES-256 key (chmod 600)
+      objects/<sha[:2]>/<sha[2:]> one file per content-addressed blob
+      manifests/<sha[:2]>/<sha[2:]>.json  one file per manifest
+
+  objects/ are the actual file bytes stored by SHA-256 of plaintext content.
+  checkout reflinks from objects/ into the working tree (same inode extents
+  on CoW filesystems like btrfs/XFS/APFS, so snapshots are near-zero cost).
+
+REMOTE LAYOUT
+
+  <bucket>/<prefix>/
+    salt                          16 random bytes; present iff key was
+                                  derived from a passphrase (optional)
+    blobs/<sha>                   one object per blob (encrypted if key set)
+    manifests/<sha>               one object per manifest (encrypted if key set)
+
+  The remote object key is always the SHA-256 of the plaintext, even when
+  the object content is encrypted. This preserves client-side dedup:
+  identical plaintext from two clients uploads under the same key.
+
+  One bucket can host many shasync projects — each lives under its own
+  <prefix>. Dedup is per-prefix, not bucket-wide.
+
+MANIFEST FORMAT
+
+Manifests are canonical JSON (sorted keys, indented). Each file entry:
+
+  {
+    "version": 1,
+    "parent_sha": "<parent manifest sha or empty>",
+    "created_at": <unix-ms>,
+    "message": "<commit message>",
+    "files": {
+      "<relative/path>": {
+        "sha":        "<blob sha>",
+        "size":       <bytes>,
+        "updated_at": <file mtime unix-ms>,
+        "mode":       <unix permission bits>
+      }, ...
+    }
+  }
+
+The manifest is itself hashed and stored as manifests/<sha>, so it's both
+the commit identifier and the payload.
+
+DATA FLOW — commit
+
+  walk working tree  →  for each file, if (path, size, mtime) matches
+  parent manifest, reuse parent's SHA; else hash + ingest into objects/
+  →  build new manifest  →  hash it  →  write manifests/<sha>  →  update HEAD.
+
+DATA FLOW — push
+
+  collect blob SHAs referenced by the tip manifest (and any local parent
+  manifests the remote lacks) → for each blob, HEAD-check the remote; if
+  absent, open local object → optionally encrypt → upload → upload
+  manifests last so a remote observer never sees a dangling manifest.
+
+DATA FLOW — pull
+
+  download manifest <sha> (and parents, best effort) → optionally decrypt
+  and verify SHA matches the requested name → collect all blob SHAs →
+  download each blob in parallel → decrypt + SHA-verify → write to
+  objects/. Call "shasync checkout <sha>" to materialise files.
+
+ENCRYPTION
+
+Optional. If .blobs/key (or SHASYNC_KEY) is present, push encrypts and
+pull decrypts + SHA-verifies before writing locally. See "shasync help
+encryption" for threat model, passphrase/Argon2id setup, and wire format.
+
+DETERMINISTIC REUSE
+
+Content addressing gives you idempotency for free: pushing twice uploads
+nothing new; pulling twice downloads nothing new; the same file committed
+in two different repos points at the same blob SHA (and dedups if they
+share a remote prefix). HEAD is the only mutable pointer.
+`
+
 var helpTopics = map[string]string{
 	"getting-started": gettingStartedHelp,
 	"quickstart":      gettingStartedHelp,
+	"architecture":    architectureHelp,
+	"system":          architectureHelp,
+	"design":          architectureHelp,
 	"s3":              s3Help,
 	"gcs":             gcsHelp,
 	"ssh":             sshHelp,
@@ -389,6 +543,7 @@ var helpTopics = map[string]string{
 	"encryption":      encryptionHelp,
 	"encrypt":         encryptionHelp,
 	"key":             encryptionHelp,
+	"passphrase":      encryptionHelp,
 }
 
 func cmdHelp(args []string) error {

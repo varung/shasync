@@ -37,7 +37,7 @@ func main() {
 	case "pull":
 		err = cmdPull(ctx, os.Args[2:])
 	case "key":
-		err = cmdKey(os.Args[2:])
+		err = cmdKey(ctx, os.Args[2:])
 	case "-h", "--help":
 		fmt.Print(mainHelp)
 		return
