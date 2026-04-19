@@ -32,7 +32,11 @@ shasync log
 
 ## Documentation
 
-All docs are accessible from the binary itself:
+For the full system design — local/remote layout, data flows, encryption
+wire format, threat model, and browser-client plans — see
+[ARCHITECTURE.md](ARCHITECTURE.md).
+
+All docs are also accessible from the binary itself:
 
 ```bash
 shasync --help                  # command reference
