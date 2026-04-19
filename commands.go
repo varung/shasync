@@ -380,6 +380,7 @@ func cmdStatus() error {
 func cmdLog(args []string) error {
 	fsFlag := flag.NewFlagSet("log", flag.ExitOnError)
 	n := fsFlag.Int("n", 20, "max entries")
+	summary := fsFlag.Bool("summary", false, "omit the per-file change list")
 	_ = fsFlag.Parse(args)
 	s, err := findStore()
 	if err != nil {
@@ -398,10 +399,149 @@ func cmdLog(args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("%s  %d files  %s\n", sha, len(m.Files), m.Message)
+		date := "(unknown)"
+		if m.CreatedAt > 0 {
+			date = time.UnixMilli(m.CreatedAt).Format("2006-01-02 15:04:05")
+		}
+		msg := m.Message
+		if msg == "" {
+			msg = "(no message)"
+		}
+		var parentFiles map[string]*ManifestFile
+		if m.ParentSHA != "" && s.hasManifest(m.ParentSHA) {
+			pm, err := s.readManifest(m.ParentSHA)
+			if err != nil {
+				return err
+			}
+			parentFiles = pm.Files
+		}
+		added, modified, removed := diffManifestFiles(parentFiles, m.Files)
+		fmt.Printf("%s  %s  %d files  (+%d ~%d -%d)  %s\n",
+			sha, date, len(m.Files), len(added), len(modified), len(removed), msg)
+		if !*summary {
+			for _, p := range added {
+				fmt.Printf("    A  %s\n", p)
+			}
+			for _, p := range modified {
+				fmt.Printf("    M  %s\n", p)
+			}
+			for _, p := range removed {
+				fmt.Printf("    D  %s\n", p)
+			}
+		}
 		sha = m.ParentSHA
 	}
 	return nil
+}
+
+// diffManifestFiles returns paths added / modified / removed going from
+// parent -> cur. A nil parent means every path in cur is an addition.
+func diffManifestFiles(parent, cur map[string]*ManifestFile) (added, modified, removed []string) {
+	for p, f := range cur {
+		pf, ok := parent[p]
+		if !ok {
+			added = append(added, p)
+			continue
+		}
+		if pf.SHA != f.SHA {
+			modified = append(modified, p)
+		}
+	}
+	for p := range parent {
+		if _, ok := cur[p]; !ok {
+			removed = append(removed, p)
+		}
+	}
+	sort.Strings(added)
+	sort.Strings(modified)
+	sort.Strings(removed)
+	return
+}
+
+// --- info ---
+
+func cmdInfo() error {
+	s, err := findStore()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("repo:       %s\n", s.Root)
+
+	head, err := s.readHead()
+	if err != nil {
+		return err
+	}
+	if head == "" {
+		fmt.Println("HEAD:       (none)")
+	} else {
+		fmt.Printf("HEAD:       %s\n", head)
+		if hm, err := s.readManifest(head); err == nil {
+			date := ""
+			if hm.CreatedAt > 0 {
+				date = time.UnixMilli(hm.CreatedAt).Format("2006-01-02 15:04:05")
+			}
+			msg := hm.Message
+			if msg == "" {
+				msg = "(no message)"
+			}
+			fmt.Printf("            %s  %d files  %s\n", date, len(hm.Files), msg)
+		}
+	}
+
+	c, err := s.readConfig()
+	if err != nil {
+		return err
+	}
+	if c.Remote == "" {
+		fmt.Println("remote:     (none)")
+	} else {
+		fmt.Printf("remote:     %s\n", c.Remote)
+	}
+
+	envKey := strings.TrimSpace(os.Getenv("SHASYNC_KEY")) != ""
+	_, keyStatErr := os.Stat(s.keyPath())
+	fileKey := keyStatErr == nil
+	switch {
+	case envKey && fileKey:
+		fmt.Println("encryption: enabled (SHASYNC_KEY env set; .blobs/key also present — env wins)")
+	case envKey:
+		fmt.Println("encryption: enabled (via SHASYNC_KEY env var)")
+	case fileKey:
+		fmt.Printf("encryption: enabled (%s)\n", s.keyPath())
+	default:
+		fmt.Println("encryption: disabled — push/pull are plaintext")
+	}
+
+	objCount, objBytes := countStoreDir(s.objectsPath())
+	manCount, _ := countStoreDir(s.manifestsPath())
+	fmt.Printf("objects:    %d blobs, %s on disk\n", objCount, humanBytes(objBytes))
+	fmt.Printf("manifests:  %d\n", manCount)
+	return nil
+}
+
+func countStoreDir(root string) (count int, size int64) {
+	_ = filepath.Walk(root, func(_ string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		count++
+		size += info.Size()
+		return nil
+	})
+	return
+}
+
+func humanBytes(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
 // --- head ---

@@ -28,6 +28,8 @@ func main() {
 		err = cmdStatus()
 	case "log":
 		err = cmdLog(os.Args[2:])
+	case "info":
+		err = cmdInfo()
 	case "head":
 		err = cmdHead()
 	case "remote":

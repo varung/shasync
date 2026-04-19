@@ -23,7 +23,8 @@ COMMANDS
   commit [-m <msg>]             snapshot the working tree, print manifest SHA
   checkout <sha> [--force]      reflink files from manifest <sha> into the dir
   status                        show changes vs HEAD
-  log [-n <count>]              walk the manifest parent chain
+  log [-n <count>] [-summary]   walk the manifest chain with dates + file diffs
+  info                          summary: repo, HEAD, remote, encryption, counts
   head                          print the HEAD manifest SHA
   remote set <url>              configure remote (gs://... or s3://...)
   remote show                   print the configured remote
@@ -430,7 +431,8 @@ COMMANDS
   commit [-m <msg>]           snapshot the working tree; writes a new manifest
   checkout <sha> [--force]    materialise manifest <sha> into the working tree
   status                      show changes vs HEAD (path + size + mtime fast check)
-  log [-n <count>]            walk the manifest parent chain
+  log [-n <count>] [-summary] walk the manifest chain with dates + file diffs
+  info                        summary: repo path, HEAD, remote, encryption, counts
   head                        print the HEAD manifest SHA
   remote set <url>            configure remote (gs://... or s3://...)
   remote show                 print the configured remote
