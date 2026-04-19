@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
@@ -26,15 +28,29 @@ func newS3Remote(ctx context.Context, bucket, prefix string) (Remote, error) {
 		return nil, err
 	}
 	var optFns []func(*s3.Options)
-	if ep := os.Getenv("SHASYNC_S3_ENDPOINT"); ep != "" {
+	customEndpoint := os.Getenv("SHASYNC_S3_ENDPOINT")
+	if customEndpoint != "" {
 		optFns = append(optFns, func(o *s3.Options) {
-			o.BaseEndpoint = aws.String(ep)
+			o.BaseEndpoint = aws.String(customEndpoint)
 		})
 	}
 	if os.Getenv("SHASYNC_S3_FORCE_PATH_STYLE") == "1" {
 		optFns = append(optFns, func(o *s3.Options) {
 			o.UsePathStyle = true
 		})
+	}
+	// Auto-detect the bucket's region so a misconfigured default region
+	// doesn't turn every HeadObject into a 301. Skip when a custom endpoint
+	// is in use (MinIO/Ceph/etc. don't speak the AWS bucket-region protocol).
+	if customEndpoint == "" {
+		probe := s3.NewFromConfig(cfg, optFns...)
+		region, err := manager.GetBucketRegion(ctx, probe, bucket)
+		if err != nil {
+			return nil, fmt.Errorf("detect region for bucket %q: %w", bucket, err)
+		}
+		if region != "" && region != cfg.Region {
+			cfg.Region = region
+		}
 	}
 	c := s3.NewFromConfig(cfg, optFns...)
 	return &s3Remote{client: c, bucket: bucket, prefix: strings.TrimSuffix(prefix, "/")}, nil
