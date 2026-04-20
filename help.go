@@ -20,16 +20,18 @@ USAGE
 
 COMMANDS
   init                          initialize .blobs/ in the current directory
-  commit [-m <msg>]             snapshot the working tree, print manifest SHA
+  commit [-m <msg>] [--offline] snapshot the working tree, print manifest SHA
+                                (by default: refuses if remote HEAD is ahead)
   checkout <sha> [--force]      reflink files from manifest <sha> into the dir
   status                        show changes vs HEAD
-  log [-n <count>] [-summary]   walk the manifest chain with dates + file diffs
+  log [-n <count>] [--remote]   walk the manifest chain with dates + file diffs
   info                          summary: repo, HEAD, remote, encryption, counts
   head                          print the HEAD manifest SHA
   remote set <url>              configure remote (gs://... or s3://...)
   remote show                   print the configured remote
-  push [<sha>]                  upload manifest + blobs to remote (default HEAD)
-  pull <sha>                    download manifest + blobs from remote
+  push [<sha>] [--force]        upload + update remote HEAD; auto-merges forks
+  pull [<sha>]                  no arg: sync working tree to remote HEAD;
+                                with arg: download only (run checkout after)
   key gen                       generate a random 32-byte repo encryption key
   key set-passphrase            derive a key from a passphrase via Argon2id
   key show                      print the configured encryption key (or "none")
@@ -37,6 +39,7 @@ COMMANDS
 
 HELP TOPICS
   getting-started   quickstart: init, commit, checkout, log
+  workflow          multi-machine sync: pull → commit → push, auto-merge
   architecture      full system overview: layout, commands, data flow
   s3                using an S3 remote (including credentials)
   gcs               using a Google Cloud Storage remote (including credentials)
@@ -428,16 +431,24 @@ blob store (S3 / GCS / rsync-over-SSH), and a thin command surface.
 COMMANDS
 
   init                        create .blobs/ in the current directory
-  commit [-m <msg>]           snapshot the working tree; writes a new manifest
+  commit [-m <msg>] [--offline|--force]
+                              snapshot the working tree; refuses by default if
+                              remote HEAD is ahead of local (--offline skips the
+                              network check; --force commits anyway)
   checkout <sha> [--force]    materialise manifest <sha> into the working tree
   status                      show changes vs HEAD (path + size + mtime fast check)
-  log [-n <count>] [-summary] walk the manifest chain with dates + file diffs
+  log [-n <count>] [--remote] walk the manifest chain with dates + file diffs;
+                              --remote starts at the remote HEAD instead
   info                        summary: repo path, HEAD, remote, encryption, counts
   head                        print the HEAD manifest SHA
   remote set <url>            configure remote (gs://... or s3://...)
   remote show                 print the configured remote
-  push [<sha>]                upload manifest chain + blobs to remote
-  pull <sha>                  download manifest chain + blobs from remote
+  push [<sha>] [--force]      upload chain; set remote HEAD; auto-merges if
+                              local and remote have diverged (conflict-copy
+                              files written for simultaneous edits)
+  pull [<sha>]                no arg: read remote HEAD, download, check out,
+                              update local HEAD (single-command sync).
+                              with arg: download the named chain only.
   key gen                     random 32-byte AES-256 key at .blobs/key
   key set-passphrase          Argon2id-derived key from a memorable passphrase
   key show                    print the currently loaded key (hex)
@@ -462,6 +473,10 @@ LOCAL LAYOUT
 REMOTE LAYOUT
 
   <bucket>/<prefix>/
+    HEAD                          64 hex chars + "\n"; current tip manifest.
+                                  Always plaintext — the SHA is already the
+                                  public object name of the manifest it points
+                                  to, so publishing it leaks no information.
     salt                          16 random bytes; present iff key was
                                   derived from a passphrase (optional)
     blobs/<sha>                   one object per blob (encrypted if key set)
@@ -473,6 +488,11 @@ REMOTE LAYOUT
 
   One bucket can host many shasync projects — each lives under its own
   <prefix>. Dedup is per-prefix, not bucket-wide.
+
+  HEAD is the one mutable file in the bucket. A fresh clone reads it to
+  discover the current tip; push rewrites it. Concurrent pushes race
+  last-writer-wins — acceptable for single-user mode, which is the
+  design target. See the "workflow" help topic for the full story.
 
 MANIFEST FORMAT
 
@@ -527,12 +547,112 @@ DETERMINISTIC REUSE
 Content addressing gives you idempotency for free: pushing twice uploads
 nothing new; pulling twice downloads nothing new; the same file committed
 in two different repos points at the same blob SHA (and dedups if they
-share a remote prefix). HEAD is the only mutable pointer.
+share a remote prefix). Two mutable pointers exist: one per machine at
+.blobs/HEAD, and one shared at <prefix>/HEAD on the remote.
+`
+
+const workflowHelp = `MULTI-MACHINE WORKFLOW
+
+shasync is designed around a single user editing the same folder from
+multiple machines. The intended pattern is:
+
+    $ shasync pull            # sync from remote HEAD
+    (edit files)
+    $ shasync commit -m "..."  # refuses if the remote moved while you were away
+    $ shasync push            # updates remote HEAD
+
+The remote holds a single mutable pointer <prefix>/HEAD (plaintext, just a
+64-char SHA). Push rewrites it; pull reads it. This is the only shared
+state; everything else is content-addressed and immutable.
+
+FAST CLONE ON A NEW MACHINE
+
+    mkdir my-project && cd my-project
+    shasync init
+    shasync remote set s3://my-bucket/my-project
+    # (key setup if encryption is in use — see "shasync help encryption")
+    shasync pull            # no SHA needed; reads remote HEAD
+
+"pull" with no argument reads the remote HEAD pointer, downloads the tip
+manifest + every blob it references, walks the parent chain (best-effort)
+so "shasync log" works offline, checks out the tip, and updates the local
+HEAD. It's the one-shot sync.
+
+COMMIT REFUSES IF THE REMOTE IS AHEAD
+
+By default "commit" contacts the remote to check that local HEAD is not
+behind remote HEAD. If the remote has moved, it refuses and tells you to
+pull first — catching the single-user mistake of forgetting to pull
+before editing on a second machine. Flags:
+
+    --offline    skip the network check (use when genuinely offline;
+                 push will auto-merge later if needed)
+    --force      commit anyway, even knowing you are diverging
+
+If the remote is unreachable, commit proceeds with a warning rather than
+failing — offline work Just Works without flags.
+
+PUSH: THREE TOPOLOGIES
+
+Push reads remote HEAD and picks a strategy:
+
+  1. fast-forward (remote HEAD is ancestor of local HEAD or equal): upload
+     any new blobs/manifests and rewrite remote HEAD. This is the common
+     case.
+
+  2. behind (local is an ancestor of remote): refuse — you missed a push
+     from another machine. Run "shasync pull" first.
+
+  3. diverged (both machines committed from the same base and neither
+     chain contains the other): auto-merge.
+
+AUTO-MERGE WITH CONFLICT-COPY FILES
+
+Divergence is rare in single-user mode (only happens if you commit
+offline on two machines before either pushes). When push detects it:
+
+  * Downloads the remote chain back to the common ancestor.
+  * Builds a merge manifest whose parent is the remote tip. Files changed
+    on only one side are taken from that side. Files changed identically
+    on both sides are a no-op. Files changed differently on both sides
+    are "conflicts":
+      - The remote version keeps the original path.
+      - The local version is saved alongside as
+        "<stem> (conflict from <hostname> <YYYY-MM-DD HHMMSS>)<ext>"
+        (Dropbox-style).
+  * Updates the local working tree to the merge state.
+  * Pushes the merge commit and updates remote HEAD.
+
+The local-only branch becomes an orphan on disk. This is intentional:
+v1 manifests record a single parent, which keeps the history rendered
+by "shasync log" linear. A v2 schema could record both parents and
+render a true DAG; see ARCHITECTURE.md.
+
+To resolve conflicts, edit the surviving file to merge the two versions,
+delete the "(conflict from ...)" copy, and commit. No special command
+needed — conflict copies are just files.
+
+DISCOVERING REMOTE STATE
+
+    shasync log --remote     # walk the remote chain from its HEAD
+
+Useful on a fresh clone before you pull, or to inspect what another
+machine pushed recently. Only fetches manifests (not blobs), bounded
+by -n.
+
+ENCRYPTION INTERACTION
+
+Everything above works the same whether or not a key is configured.
+The remote HEAD pointer is plaintext either way — it's a SHA that names
+a manifest object; the manifest itself is encrypted if a key is set.
 `
 
 var helpTopics = map[string]string{
 	"getting-started": gettingStartedHelp,
 	"quickstart":      gettingStartedHelp,
+	"workflow":        workflowHelp,
+	"sync":            workflowHelp,
+	"multi-machine":   workflowHelp,
 	"architecture":    architectureHelp,
 	"system":          architectureHelp,
 	"design":          architectureHelp,

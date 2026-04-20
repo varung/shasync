@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"cloud.google.com/go/storage"
+	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 )
 
@@ -62,4 +63,29 @@ func (g *gcsRemote) Upload(ctx context.Context, key string, r io.Reader) error {
 
 func (g *gcsRemote) Download(ctx context.Context, key string) (io.ReadCloser, error) {
 	return g.client.Bucket(g.bucket).Object(g.key(key)).NewReader(ctx)
+}
+
+func (g *gcsRemote) List(ctx context.Context, prefix string) ([]string, error) {
+	full := g.key(prefix)
+	stripLen := 0
+	if g.prefix != "" {
+		stripLen = len(g.prefix) + 1
+	}
+	var out []string
+	it := g.client.Bucket(g.bucket).Objects(ctx, &storage.Query{Prefix: full})
+	for {
+		attrs, err := it.Next()
+		if errors.Is(err, iterator.Done) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		k := attrs.Name
+		if stripLen > 0 && len(k) >= stripLen {
+			k = k[stripLen:]
+		}
+		out = append(out, k)
+	}
+	return out, nil
 }

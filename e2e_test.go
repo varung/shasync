@@ -63,7 +63,7 @@ func TestCommitAndCheckoutRoundTrip(t *testing.T) {
 	chdir(t, a)
 
 	must(t, cmdInit())
-	must(t, cmdCommit([]string{"-m", "first"}))
+	must(t, cmdCommit(context.Background(), []string{"-m", "first"}))
 
 	s, err := findStore()
 	if err != nil {
@@ -76,7 +76,7 @@ func TestCommitAndCheckoutRoundTrip(t *testing.T) {
 
 	// Modify a file, commit again.
 	write(t, filepath.Join(a, "hello.txt"), "changed\n")
-	must(t, cmdCommit([]string{"-m", "edit"}))
+	must(t, cmdCommit(context.Background(), []string{"-m", "edit"}))
 	head2, _ := s.readHead()
 	if head1 == head2 {
 		t.Fatal("expected new HEAD after edit")
@@ -153,7 +153,7 @@ func runRemoteRoundTrip(t *testing.T, remoteURL string) {
 	a := makeWorkTree(t)
 	chdir(t, a)
 	must(t, cmdInit())
-	must(t, cmdCommit([]string{"-m", "A-first"}))
+	must(t, cmdCommit(context.Background(), []string{"-m", "A-first"}))
 	must(t, cmdRemote([]string{"set", remoteURL}))
 	must(t, cmdPush(ctx, nil))
 
@@ -216,7 +216,7 @@ func TestEncryptedPushPullViaS3Emulator(t *testing.T) {
 	chdir(t, a)
 	must(t, cmdInit())
 	must(t, cmdKey(ctx, []string{"gen"}))
-	must(t, cmdCommit([]string{"-m", "encrypted"}))
+	must(t, cmdCommit(context.Background(), []string{"-m", "encrypted"}))
 	must(t, cmdRemote([]string{"set", remoteURL}))
 	must(t, cmdPush(ctx, nil))
 
@@ -247,6 +247,16 @@ func TestEncryptedPushPullViaS3Emulator(t *testing.T) {
 		}
 		if o.Key == "encrypted-project/salt" {
 			continue // salt is stored plaintext by design
+		}
+		if o.Key == "encrypted-project/HEAD" {
+			// HEAD is plaintext by design (a 64-hex SHA that's already the
+			// public name of a manifest object — adds no information over
+			// what a listing already exposes). Must not leak file content
+			// though.
+			if bytesContains(body, []byte(marker)) {
+				t.Fatalf("object %s leaks plaintext marker %q", o.Key, marker)
+			}
+			continue
 		}
 		if len(body) < cryptMagicLen || string(body[:cryptMagicLen]) != cryptMagicV2 {
 			t.Fatalf("object %s is not shasync-v2-encrypted: first bytes = %q", o.Key, body[:min(16, len(body))])
@@ -312,7 +322,7 @@ func TestPassphraseRoundTripViaS3Emulator(t *testing.T) {
 	must(t, cmdInit())
 	must(t, cmdRemote([]string{"set", remoteURL}))
 	must(t, cmdKey(ctx, []string{"set-passphrase"}))
-	must(t, cmdCommit([]string{"-m", "passphrase commit"}))
+	must(t, cmdCommit(context.Background(), []string{"-m", "passphrase commit"}))
 	must(t, cmdPush(ctx, nil))
 
 	sA, _ := findStore()
@@ -410,4 +420,271 @@ func bytesContains(haystack, needle []byte) bool {
 		}
 	}
 	return false
+}
+
+// --- Linear-history workflow tests --------------------------------------
+//
+// These exercise the full single-user "pull → commit → push" story across
+// two machines sharing an S3 bucket: remote HEAD, pull-no-args, commit
+// pre-flight, log --remote, and the divergent-push auto-merge with
+// conflict-copy files.
+
+func newS3Fake(t *testing.T, bucket string) string {
+	t.Helper()
+	backend := s3mem.New()
+	faker := gofakes3.New(backend)
+	srv := httptest.NewServer(faker.Server())
+	t.Cleanup(srv.Close)
+	if err := backend.CreateBucket(bucket); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SHASYNC_S3_ENDPOINT", srv.URL)
+	t.Setenv("SHASYNC_S3_FORCE_PATH_STYLE", "1")
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	t.Setenv("AWS_REGION", "us-east-1")
+	return srv.URL
+}
+
+// TestPullNoArgsFetchesRemoteHead: clean-clone scenario — pull with no SHA
+// reads remote HEAD, fetches everything, and leaves the working tree synced.
+func TestPullNoArgsFetchesRemoteHead(t *testing.T) {
+	newS3Fake(t, "shasync-test")
+	ctx := context.Background()
+	remoteURL := "s3://shasync-test/sync-project"
+
+	// A: init + commit + push.
+	a := makeWorkTree(t)
+	chdir(t, a)
+	must(t, cmdInit())
+	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdCommit(ctx, []string{"-m", "A-first"}))
+	must(t, cmdPush(ctx, nil))
+	sA, _ := findStore()
+	headA, _ := sA.readHead()
+
+	// B: fresh clone; pull with no args should materialize working tree.
+	b := t.TempDir()
+	chdir(t, b)
+	must(t, cmdInit())
+	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdPull(ctx, nil))
+	sB, _ := findStore()
+	headB, _ := sB.readHead()
+	if headB != headA {
+		t.Fatalf("local HEAD after pull = %s, want %s", headB, headA)
+	}
+	for _, rel := range []string{"hello.txt", "sub/a.txt", "sub/b.bin"} {
+		if read(t, filepath.Join(a, rel)) != read(t, filepath.Join(b, rel)) {
+			t.Fatalf("file %s differs after clone-pull", rel)
+		}
+	}
+
+	// Idempotency: second pull is a no-op.
+	must(t, cmdPull(ctx, nil))
+}
+
+// TestCommitRefusesWhenRemoteAhead: machine B commits without pulling first;
+// the pre-flight check must refuse unless --offline is passed.
+func TestCommitRefusesWhenRemoteAhead(t *testing.T) {
+	newS3Fake(t, "shasync-test")
+	ctx := context.Background()
+	remoteURL := "s3://shasync-test/linear-project"
+
+	// A: push an initial commit.
+	a := makeWorkTree(t)
+	chdir(t, a)
+	must(t, cmdInit())
+	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdCommit(ctx, []string{"-m", "A-first"}))
+	must(t, cmdPush(ctx, nil))
+
+	// B: clone by pull, then A pushes a *newer* commit while B is offline.
+	b := t.TempDir()
+	chdir(t, b)
+	must(t, cmdInit())
+	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdPull(ctx, nil))
+
+	// A moves forward.
+	chdir(t, a)
+	write(t, filepath.Join(a, "hello.txt"), "A-edit\n")
+	must(t, cmdCommit(ctx, []string{"-m", "A-second"}))
+	must(t, cmdPush(ctx, nil))
+
+	// B tries to commit without pulling: must fail.
+	chdir(t, b)
+	write(t, filepath.Join(b, "sub", "a.txt"), "B-edit\n")
+	if err := cmdCommit(ctx, []string{"-m", "B-oblivious"}); err == nil {
+		t.Fatal("expected commit to refuse when remote is ahead")
+	}
+
+	// --offline lets it through.
+	must(t, cmdCommit(ctx, []string{"-m", "B-offline", "--offline"}))
+}
+
+// TestLogRemoteWalksChain: push a few commits, then verify log --remote
+// walks the chain in reverse-chronological order.
+func TestLogRemoteWalksChain(t *testing.T) {
+	newS3Fake(t, "shasync-test")
+	ctx := context.Background()
+	remoteURL := "s3://shasync-test/log-project"
+
+	a := makeWorkTree(t)
+	chdir(t, a)
+	must(t, cmdInit())
+	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdCommit(ctx, []string{"-m", "c1"}))
+	must(t, cmdPush(ctx, nil))
+	write(t, filepath.Join(a, "hello.txt"), "v2\n")
+	must(t, cmdCommit(ctx, []string{"-m", "c2"}))
+	must(t, cmdPush(ctx, nil))
+	write(t, filepath.Join(a, "hello.txt"), "v3\n")
+	must(t, cmdCommit(ctx, []string{"-m", "c3"}))
+	must(t, cmdPush(ctx, nil))
+
+	// Fresh clone with no HEAD: log --remote should reach all three.
+	b := t.TempDir()
+	chdir(t, b)
+	must(t, cmdInit())
+	must(t, cmdRemote([]string{"set", remoteURL}))
+	if err := cmdLog(ctx, []string{"--remote", "--summary"}); err != nil {
+		t.Fatalf("log --remote: %v", err)
+	}
+
+	// After the call, local store should hold all three manifests.
+	sB, _ := findStore()
+	manCount, _ := countStoreDir(sB.manifestsPath())
+	if manCount != 3 {
+		t.Fatalf("expected 3 manifests cached after log --remote, got %d", manCount)
+	}
+}
+
+// TestDivergentPushAutoMerges: both machines commit independently from the
+// same base. Push on the second machine must detect the fork, pull the
+// remote tip, create a merge commit whose parent is remote HEAD, and write
+// a conflict-copy for the single file both sides changed differently.
+func TestDivergentPushAutoMerges(t *testing.T) {
+	newS3Fake(t, "shasync-test")
+	ctx := context.Background()
+	remoteURL := "s3://shasync-test/merge-project"
+
+	// A: establish base.
+	a := makeWorkTree(t)
+	chdir(t, a)
+	must(t, cmdInit())
+	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdCommit(ctx, []string{"-m", "base"}))
+	must(t, cmdPush(ctx, nil))
+
+	// B: clone base.
+	b := t.TempDir()
+	chdir(t, b)
+	must(t, cmdInit())
+	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdPull(ctx, nil))
+
+	// A: change hello.txt to "A-version", push.
+	chdir(t, a)
+	write(t, filepath.Join(a, "hello.txt"), "A-version\n")
+	// A also adds a new file only on A's side.
+	write(t, filepath.Join(a, "a-only.txt"), "A made this\n")
+	must(t, cmdCommit(ctx, []string{"-m", "A-change"}))
+	must(t, cmdPush(ctx, nil))
+
+	// B: change hello.txt to "B-version" and sub/a.txt (B-only), commit offline, push → should auto-merge.
+	chdir(t, b)
+	write(t, filepath.Join(b, "hello.txt"), "B-version\n")
+	write(t, filepath.Join(b, "sub", "a.txt"), "B-edited\n")
+	must(t, cmdCommit(ctx, []string{"--offline", "-m", "B-change"}))
+	if err := cmdPush(ctx, nil); err != nil {
+		t.Fatalf("auto-merge push failed: %v", err)
+	}
+
+	// After merge:
+	//   hello.txt  → conflict. Kept remote ("A-version"). B's version saved
+	//                as "hello (conflict from <host> <stamp>).txt".
+	//   a-only.txt → remote-only addition, preserved as-is.
+	//   sub/a.txt  → B-only change, preserved ("B-edited").
+	if got := read(t, filepath.Join(b, "hello.txt")); got != "A-version\n" {
+		t.Fatalf("hello.txt after merge = %q, want A-version (remote keeps path on conflict)", got)
+	}
+	if got := read(t, filepath.Join(b, "a-only.txt")); got != "A made this\n" {
+		t.Fatalf("a-only.txt after merge = %q, want A made this", got)
+	}
+	if got := read(t, filepath.Join(b, "sub", "a.txt")); got != "B-edited\n" {
+		t.Fatalf("sub/a.txt after merge = %q, want B-edited", got)
+	}
+
+	// Conflict copy must exist and contain B's version.
+	entries, err := os.ReadDir(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var conflictFile string
+	for _, e := range entries {
+		if !e.IsDir() && len(e.Name()) > len("hello (conflict from ") &&
+			e.Name()[:len("hello (conflict from ")] == "hello (conflict from " {
+			conflictFile = e.Name()
+			break
+		}
+	}
+	if conflictFile == "" {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("no conflict-copy file found in %v", names)
+	}
+	if got := read(t, filepath.Join(b, conflictFile)); got != "B-version\n" {
+		t.Fatalf("conflict copy content = %q, want B-version", got)
+	}
+
+	// Third machine pulls and sees the merged state.
+	newS3Fake := t // keep tmp server alive for the duration
+	_ = newS3Fake
+	c := t.TempDir()
+	chdir(t, c)
+	must(t, cmdInit())
+	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdPull(ctx, nil))
+	if got := read(t, filepath.Join(c, "hello.txt")); got != "A-version\n" {
+		t.Fatalf("C sees hello.txt = %q, want A-version", got)
+	}
+	if got := read(t, filepath.Join(c, conflictFile)); got != "B-version\n" {
+		t.Fatalf("C sees conflict-copy = %q, want B-version", got)
+	}
+}
+
+// TestFastForwardPush: typical single-user flow — commit on A, push, pull on
+// B, commit on B, push. B's push is a fast-forward that extends remote.
+func TestFastForwardPush(t *testing.T) {
+	newS3Fake(t, "shasync-test")
+	ctx := context.Background()
+	remoteURL := "s3://shasync-test/ff-project"
+
+	a := makeWorkTree(t)
+	chdir(t, a)
+	must(t, cmdInit())
+	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdCommit(ctx, []string{"-m", "c1"}))
+	must(t, cmdPush(ctx, nil))
+
+	b := t.TempDir()
+	chdir(t, b)
+	must(t, cmdInit())
+	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdPull(ctx, nil))
+
+	// B adds a new file on top of the same base; commit + push should FF.
+	write(t, filepath.Join(b, "new.txt"), "made on B\n")
+	must(t, cmdCommit(ctx, []string{"-m", "c2-on-B"}))
+	must(t, cmdPush(ctx, nil))
+
+	// A pulls and sees new.txt.
+	chdir(t, a)
+	must(t, cmdPull(ctx, nil))
+	if got := read(t, filepath.Join(a, "new.txt")); got != "made on B\n" {
+		t.Fatalf("A sees new.txt = %q, want 'made on B'", got)
+	}
 }

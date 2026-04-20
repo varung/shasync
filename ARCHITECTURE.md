@@ -29,9 +29,15 @@ features (chiefly: in-browser access).
 
 **Non-goals**
 
-- Merge / branching / collaborative editing. Snapshots are linear.
-- Multi-writer conflict resolution — last push wins on the pointer
-  (`HEAD` is purely local; the remote has no mutable pointer).
+- Multi-user collaborative editing. shasync is single-user-across-many-
+  machines. The conflict-resolution strategy (see §6) is tuned for
+  "I occasionally commit offline on two laptops," not for a shared
+  workspace.
+- Branching. The manifest schema records a single parent; a merge commit
+  adopts the remote tip as its parent and represents its local-only
+  changes as either direct file updates or Dropbox-style conflict-copy
+  files. The orphaned local branch is acceptable in single-user mode; a
+  v2 schema could upgrade to a DAG without breaking on-disk compatibility.
 - Fine-grained access control per file. Authorization happens at the
   bucket / prefix layer.
 - Streaming encryption for multi-TB files. The wire format supports
@@ -102,6 +108,9 @@ Notes
 
 ```
 <bucket>/<prefix>/
+  HEAD                          "<64 hex chars>\n" — current tip manifest SHA.
+                                Plaintext; the only mutable pointer on the
+                                remote. Push rewrites it; pull reads it.
   salt                          16 random bytes; present iff the repo uses
                                 a passphrase-derived key
   blobs/<sha>                   one object per blob
@@ -117,14 +126,22 @@ Notes
   clients: two machines encrypting the same plaintext try to write
   under the same key, so the second one is a no-op via the `Exists`
   check.
-- There is no `HEAD` on the remote. The latest snapshot is whatever
-  SHA you happen to pull. Discovery ("what was the newest commit?")
-  is an out-of-band concern — a future add-on could write a
-  `branches/main` pointer, but the core design is content-addressed
-  and pointerless.
-- There is no listing step in the hot path. Every upload and every
-  download targets a known key computed from a SHA, so `ListObjects`
-  permissions are never needed.
+- `HEAD` is plaintext even when blobs and manifests are encrypted.
+  It stores a SHA that is already the public object name of the
+  manifest it references, so publishing it leaks nothing a bucket
+  listing wouldn't already expose. (It does reveal that *some* manifest
+  exists at that key, which any listing would also reveal.)
+- Concurrent pushes to `HEAD` race last-writer-wins. Acceptable under
+  the single-user goal; a future CAS (S3 If-Match, GCS generation
+  match) can close this window without a schema change.
+- Hot-path operations never list the bucket: upload and download
+  target keys computed from SHAs. `HEAD` is reachable with a single
+  known-key GET, and the parent chain is walked by following
+  `parent_sha` pointers — so `ListObjects` permission is still not
+  required for the critical path. `shasync log --remote` does the
+  same chain walk and needs no listing either. `Remote.List()` exists
+  for future diagnostics (detecting orphaned chains after a force-push
+  or a failed merge).
 
 ---
 
@@ -163,6 +180,12 @@ also fully produce or consume them.
 ## 6. Data flow — commit
 
 ```
+(if a remote is configured, unless --offline or --force:)
+  → read remote HEAD
+  → fetch remote chain manifests (metadata, no blobs)
+  → if remote HEAD is ancestor of local HEAD (or equal, or empty): ok
+  → else refuse: "run shasync pull first"
+  → (network errors → warn and proceed; offline Just Works)
 walk working tree
   → for each file:
       if (path, size, mtime) matches parent manifest:
@@ -172,7 +195,7 @@ walk working tree
   → build new manifest
   → canonicalize + sha256 it
   → write manifests/<sha>
-  → update HEAD
+  → update local HEAD
 ```
 
 The fast path (unchanged file) avoids even reading the file's
@@ -180,33 +203,73 @@ contents. The slow path (changed file) is a single SHA-256 pass plus
 an `ioctl(FICLONE)` — so `commit` on an unchanged 10 GB tree is
 milliseconds.
 
+The pre-flight network check is what makes the "always pull before
+commit" pattern automatic for a single user: forgetting to pull on
+machine B after a push from machine A fails fast instead of silently
+producing a divergent chain. `--offline` skips it; the fork is then
+resolved later in `push` (see §7).
+
 ---
 
 ## 7. Data flow — push
 
 ```
-resolve target manifest SHA (default: HEAD)
-collect:
-  - all ancestor manifests the remote doesn't have
-  - all blobs they reference
-for each blob in parallel (16 workers):
-  HEAD-check remote. If present, skip.
-  Read local object. If a key is configured, encrypt. Upload.
-for each manifest (oldest-first):
-  HEAD-check. If present, skip.
-  Read, encrypt, upload.
+resolve target manifest SHA (default: local HEAD)
+read remote HEAD  (empty on first push)
+
+(unless --force, classify:)
+  remote HEAD is "" | == local | ancestor-of-local  → fast-forward
+  local is ancestor-of-remote                       → refuse ("pull first")
+  otherwise                                         → diverged → auto-merge
+
+(fast-forward path):
+  for each blob in parallel (16 workers):
+    HEAD-check remote. If present, skip.
+    Read local object. Encrypt if keyed. Upload.
+  for each manifest (tip last, so a remote observer never sees a
+  manifest whose parents haven't landed):
+    upload (encrypted if keyed)
+  overwrite <prefix>/HEAD with the pushed SHA
+
+(diverged path):
+  fetch remote chain (manifests) back past the common ancestor
+  fetch any blobs the remote chain references that we don't have
+  build merge manifest:
+    parent = remote tip
+    for each path in union(ancestor, remote, local):
+      neither side changed                 → skip
+      only one side changed                → take that side
+      both sides changed identically       → either (same SHA)
+      both sides changed differently       → conflict:
+          keep remote at path
+          save local copy as "<stem> (conflict from <host> <stamp>)<ext>"
+  write merge manifest locally
+  checkout merge into working tree (overwrites; requires clean tree)
+  fall through to fast-forward upload of the merge
 ```
 
-Manifests are uploaded last so a remote observer never sees a
-manifest whose blobs haven't landed. This matters when another client
-is polling for new commits: the "commit is visible" transition is
-manifest-atomic.
+The "tip last" upload order makes the "commit is visible" transition
+manifest-atomic: a second machine polling the remote will either see
+the old chain or the new tip and its complete ancestry, never a
+dangling pointer. `HEAD` is rewritten after the manifest lands so the
+pointer transition is likewise atomic at the HTTP level.
+
+Divergence is the one path where shasync takes a non-obvious action on
+the user's working tree. It's scoped to a single-user scenario where
+two machines each committed offline and neither had pulled first.
+Single-parent manifest semantics are preserved: the merge commit's
+parent is the remote tip, and the local-only branch becomes an orphan.
+Nothing is ever lost — both SHAs still exist on both sides of the
+merge and the conflict-copy files are real blobs in the merge manifest
+— but the linear chain renderable by `shasync log` stays linear.
 
 ---
 
 ## 8. Data flow — pull
 
 ```
+(no arg: target = readRemoteHead())
+if target already == local HEAD: "already up to date"; done.
 if manifests/<target> not local:
   download it (decrypt + verify sha)
 walk the parent chain:
@@ -217,7 +280,16 @@ for each missing blob in parallel (16 workers):
   download
   if key configured: decrypt + verify sha before writing locally
   else:              stream directly to objects/<sha>
+
+(no-arg path only:)
+  checkout <target>      → materialize working tree, update local HEAD
 ```
+
+Pulling with no argument is the single-command sync: a fresh clone or
+a machine that's fallen behind becomes current in one call. Pulling
+with an explicit SHA retains the older download-only semantics so
+scripts that inspect the chain without touching the working tree
+still work.
 
 Post-pull, the local `objects/` directory has everything needed to
 `checkout <target>`. `checkout` is offline — it only reads from the
@@ -402,10 +474,16 @@ addition possible without breaking the wire format.
   "start a new prefix, re-push, delete the old prefix." A future
   design could store per-blob key-wrapping metadata in the
   manifest; deliberately deferred.
-- **A `refs/` concept.** Right now the only mutable pointer lives
-  locally in `.blobs/HEAD`. Publishing "the latest commit" to the
-  remote would help multi-user flows and browser viewers; exact
-  semantics (atomic swap? last-writer-wins?) are TBD.
+- **Multi-parent (DAG) manifests.** The v1 schema records a single
+  parent, so auto-merge adopts the remote tip as the sole parent and
+  orphans the local-only branch. A v2 could record `parent_shas: []`
+  and render a true DAG in `log`. Deliberately deferred until the
+  single-parent-with-conflict-copies approach proves insufficient.
+- **CAS on remote HEAD.** Concurrent pushes race last-writer-wins on
+  `<prefix>/HEAD`. S3 supports `If-Match` on the ETag; GCS has
+  generation-number precondition. Adding it would close the race
+  without any schema change. Not a priority under the single-user
+  goal.
 - **Full browser port.** The design is ready for it. The missing
   pieces are a static page, an auth hookup (Firebase Auth is the
   obvious choice), and a WASM Argon2id binding.
@@ -425,6 +503,7 @@ addition possible without breaking the wire format.
 | `remote.go`           | `Remote` interface; URL parsing; parallel helper      |
 | `remote_s3.go`        | S3 implementation                                     |
 | `remote_gcs.go`       | GCS implementation                                    |
+| `sync.go`             | Remote HEAD I/O; ancestor queries; auto-merge         |
 | `reflink_{linux,darwin,other}.go` | Platform reflink + copy fallback          |
 | `help.go`             | Embedded help topics (`shasync help …`)               |
 | `e2e_test.go`         | End-to-end tests against S3 and GCS emulators         |

@@ -21,13 +21,13 @@ func main() {
 	case "init":
 		err = cmdInit()
 	case "commit":
-		err = cmdCommit(os.Args[2:])
+		err = cmdCommit(ctx, os.Args[2:])
 	case "checkout":
 		err = cmdCheckout(os.Args[2:])
 	case "status":
 		err = cmdStatus()
 	case "log":
-		err = cmdLog(os.Args[2:])
+		err = cmdLog(ctx, os.Args[2:])
 	case "info":
 		err = cmdInfo()
 	case "head":

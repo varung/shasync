@@ -41,6 +41,7 @@ All docs are also accessible from the binary itself:
 ```bash
 shasync --help                  # command reference
 shasync help getting-started    # quickstart walkthrough
+shasync help workflow           # multi-machine sync (pull → commit → push, auto-merge)
 shasync help architecture       # full system overview: layout, commands, data flow
 shasync help encryption         # client-side encryption + passphrase setup
 shasync help s3                 # using an S3 remote (incl. credentials)
@@ -48,6 +49,34 @@ shasync help gcs                # using a GCS remote (incl. credentials)
 shasync help ssh                # syncing two machines over SSH with rsync
 shasync help ignore             # the .blobsignore file
 ```
+
+## Multi-machine sync
+
+shasync is designed for one user editing the same folder from several
+machines. The pattern:
+
+```bash
+# machine B, fresh clone
+mkdir my-project && cd my-project
+shasync init
+shasync remote set s3://my-bucket/my-project
+shasync pull                          # reads remote HEAD; materializes files
+
+# everyday use on either machine
+shasync pull                          # sync from remote
+(edit files)
+shasync commit -m "..."               # refuses if remote moved while you were away
+shasync push                          # updates remote HEAD
+```
+
+`commit` contacts the remote to check that you aren't behind; pass
+`--offline` to skip the check when you know you're offline. If two
+machines *do* commit from the same base without pulling, `push` on the
+second machine auto-merges against the remote tip — non-conflicting
+changes are applied, and files edited differently on both sides keep
+the remote version at the original path plus a Dropbox-style
+`<name> (conflict from <host> <date>).<ext>` copy for your local
+version. See `shasync help workflow` for the full story.
 
 ## How it works
 

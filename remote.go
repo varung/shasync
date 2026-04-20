@@ -10,10 +10,17 @@ import (
 )
 
 // Remote is an abstract blob store. Keys are slash-separated strings.
+//
+// List returns keys under the given prefix, relative to the remote root
+// (the caller-supplied prefix is *not* stripped — e.g. List(ctx, "manifests/")
+// returns keys like "manifests/<sha>"). Listing requires read-list permission
+// on the bucket (s3:ListBucket / storage.objects.list); it is only used by
+// discovery commands like `shasync log --remote`, never in the hot path.
 type Remote interface {
 	Exists(ctx context.Context, key string) (bool, error)
 	Upload(ctx context.Context, key string, r io.Reader) error
 	Download(ctx context.Context, key string) (io.ReadCloser, error)
+	List(ctx context.Context, prefix string) ([]string, error)
 }
 
 // Remote URL formats:
@@ -49,6 +56,12 @@ func splitBucketPrefix(s string) (string, string) {
 
 func remoteBlobKey(sha string) string     { return "blobs/" + sha }
 func remoteManifestKey(sha string) string { return "manifests/" + sha }
+
+// remoteHeadKey is the shared mutable pointer at <prefix>/HEAD. It contains a
+// single 64-hex-char SHA (the current tip manifest) plus a newline.
+// Stored plaintext even when encryption is on: the SHA is already the public
+// name of the manifest object, so the pointer leaks no additional information.
+const remoteHeadKey = "HEAD"
 
 // streamToFile writes rc to path via a temp file + rename, setting mode.
 func streamToFile(rc io.Reader, path string, mode os.FileMode) error {

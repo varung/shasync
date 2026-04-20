@@ -110,3 +110,37 @@ func (s *s3Remote) Download(ctx context.Context, key string) (io.ReadCloser, err
 	}
 	return out.Body, nil
 }
+
+func (s *s3Remote) List(ctx context.Context, prefix string) ([]string, error) {
+	full := s.key(prefix)
+	// s.key("") drops the prefix, so re-trim only the caller-supplied prefix
+	// when stripping; we want keys relative to the remote root.
+	stripLen := 0
+	if s.prefix != "" {
+		stripLen = len(s.prefix) + 1 // "<prefix>/"
+	}
+	var out []string
+	var token *string
+	for {
+		resp, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(s.bucket),
+			Prefix:            aws.String(full),
+			ContinuationToken: token,
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, obj := range resp.Contents {
+			k := aws.ToString(obj.Key)
+			if stripLen > 0 && len(k) >= stripLen {
+				k = k[stripLen:]
+			}
+			out = append(out, k)
+		}
+		if resp.IsTruncated == nil || !*resp.IsTruncated {
+			break
+		}
+		token = resp.NextContinuationToken
+	}
+	return out, nil
+}
