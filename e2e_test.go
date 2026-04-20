@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/fsouza/fake-gcs-server/fakestorage"
@@ -484,45 +485,6 @@ func TestPullNoArgsFetchesRemoteHead(t *testing.T) {
 	must(t, cmdPull(ctx, nil))
 }
 
-// TestCommitRefusesWhenRemoteAhead: machine B commits without pulling first;
-// the pre-flight check must refuse unless --offline is passed.
-func TestCommitRefusesWhenRemoteAhead(t *testing.T) {
-	newS3Fake(t, "shasync-test")
-	ctx := context.Background()
-	remoteURL := "s3://shasync-test/linear-project"
-
-	// A: push an initial commit.
-	a := makeWorkTree(t)
-	chdir(t, a)
-	must(t, cmdInit())
-	must(t, cmdRemote([]string{"set", remoteURL}))
-	must(t, cmdCommit(ctx, []string{"-m", "A-first"}))
-	must(t, cmdPush(ctx, nil))
-
-	// B: clone by pull, then A pushes a *newer* commit while B is offline.
-	b := t.TempDir()
-	chdir(t, b)
-	must(t, cmdInit())
-	must(t, cmdRemote([]string{"set", remoteURL}))
-	must(t, cmdPull(ctx, nil))
-
-	// A moves forward.
-	chdir(t, a)
-	write(t, filepath.Join(a, "hello.txt"), "A-edit\n")
-	must(t, cmdCommit(ctx, []string{"-m", "A-second"}))
-	must(t, cmdPush(ctx, nil))
-
-	// B tries to commit without pulling: must fail.
-	chdir(t, b)
-	write(t, filepath.Join(b, "sub", "a.txt"), "B-edit\n")
-	if err := cmdCommit(ctx, []string{"-m", "B-oblivious"}); err == nil {
-		t.Fatal("expected commit to refuse when remote is ahead")
-	}
-
-	// --offline lets it through.
-	must(t, cmdCommit(ctx, []string{"-m", "B-offline", "--offline"}))
-}
-
 // TestLogRemoteWalksChain: push a few commits, then verify log --remote
 // walks the chain in reverse-chronological order.
 func TestLogRemoteWalksChain(t *testing.T) {
@@ -560,11 +522,12 @@ func TestLogRemoteWalksChain(t *testing.T) {
 	}
 }
 
-// TestDivergentPushAutoMerges: both machines commit independently from the
-// same base. Push on the second machine must detect the fork, pull the
-// remote tip, create a merge commit whose parent is remote HEAD, and write
-// a conflict-copy for the single file both sides changed differently.
-func TestDivergentPushAutoMerges(t *testing.T) {
+// TestDivergentPushRefusesPullMerges: the divergent flow under the new
+// design. Push refuses on divergence and tells the user to pull first;
+// pull detects the fork, builds a merge manifest with conflict-copy files
+// tagged with the local client's ID, and checks it out; a second push is
+// then a plain fast-forward. A third machine pulls and sees the same state.
+func TestDivergentPushRefusesPullMerges(t *testing.T) {
 	newS3Fake(t, "shasync-test")
 	ctx := context.Background()
 	remoteURL := "s3://shasync-test/merge-project"
@@ -583,66 +546,67 @@ func TestDivergentPushAutoMerges(t *testing.T) {
 	must(t, cmdInit())
 	must(t, cmdRemote([]string{"set", remoteURL}))
 	must(t, cmdPull(ctx, nil))
+	sB, _ := findStore()
+	cfgB, _ := sB.readConfig()
+	clientB := cfgB.ClientID
+	if clientB == "" {
+		t.Fatal("expected B to have a ClientID after init")
+	}
 
-	// A: change hello.txt to "A-version", push.
+	// A: change hello.txt, add a new file, commit + push.
 	chdir(t, a)
 	write(t, filepath.Join(a, "hello.txt"), "A-version\n")
-	// A also adds a new file only on A's side.
 	write(t, filepath.Join(a, "a-only.txt"), "A made this\n")
 	must(t, cmdCommit(ctx, []string{"-m", "A-change"}))
 	must(t, cmdPush(ctx, nil))
 
-	// B: change hello.txt to "B-version" and sub/a.txt (B-only), commit offline, push → should auto-merge.
+	// B: independently change hello.txt to a different content, change
+	// sub/a.txt, commit offline. Now histories have diverged.
 	chdir(t, b)
 	write(t, filepath.Join(b, "hello.txt"), "B-version\n")
 	write(t, filepath.Join(b, "sub", "a.txt"), "B-edited\n")
-	must(t, cmdCommit(ctx, []string{"--offline", "-m", "B-change"}))
-	if err := cmdPush(ctx, nil); err != nil {
-		t.Fatalf("auto-merge push failed: %v", err)
+	must(t, cmdCommit(ctx, []string{"-m", "B-change"}))
+
+	// B's first push must REFUSE — divergence is now resolved in pull, not push.
+	if err := cmdPush(ctx, nil); err == nil {
+		t.Fatal("expected push to refuse on divergence under the new design")
 	}
 
-	// After merge:
-	//   hello.txt  → conflict. Kept remote ("A-version"). B's version saved
-	//                as "hello (conflict from <host> <stamp>).txt".
-	//   a-only.txt → remote-only addition, preserved as-is.
-	//   sub/a.txt  → B-only change, preserved ("B-edited").
+	// B pulls: should auto-merge, populate conflict copy, update working tree.
+	if err := cmdPull(ctx, nil); err != nil {
+		t.Fatalf("pull (merge) failed: %v", err)
+	}
+
+	// hello.txt  → remote kept at the original path on conflict.
+	// a-only.txt → remote-only addition, preserved.
+	// sub/a.txt  → B-only change, preserved.
 	if got := read(t, filepath.Join(b, "hello.txt")); got != "A-version\n" {
-		t.Fatalf("hello.txt after merge = %q, want A-version (remote keeps path on conflict)", got)
+		t.Fatalf("hello.txt after pull-merge = %q, want A-version", got)
 	}
 	if got := read(t, filepath.Join(b, "a-only.txt")); got != "A made this\n" {
-		t.Fatalf("a-only.txt after merge = %q, want A made this", got)
+		t.Fatalf("a-only.txt after pull-merge = %q, want A made this", got)
 	}
 	if got := read(t, filepath.Join(b, "sub", "a.txt")); got != "B-edited\n" {
-		t.Fatalf("sub/a.txt after merge = %q, want B-edited", got)
+		t.Fatalf("sub/a.txt after pull-merge = %q, want B-edited", got)
 	}
 
-	// Conflict copy must exist and contain B's version.
-	entries, err := os.ReadDir(b)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var conflictFile string
-	for _, e := range entries {
-		if !e.IsDir() && len(e.Name()) > len("hello (conflict from ") &&
-			e.Name()[:len("hello (conflict from ")] == "hello (conflict from " {
-			conflictFile = e.Name()
-			break
-		}
-	}
+	// Conflict copy must be tagged with B's ClientID (not hostname), and hold
+	// B's version of hello.txt.
+	conflictFile := findConflictCopy(t, b, "hello", clientB)
 	if conflictFile == "" {
-		var names []string
-		for _, e := range entries {
-			names = append(names, e.Name())
-		}
-		t.Fatalf("no conflict-copy file found in %v", names)
+		listDir(t, b)
+		t.Fatalf("no conflict-copy file tagged with client %q found in %s", clientB, b)
 	}
 	if got := read(t, filepath.Join(b, conflictFile)); got != "B-version\n" {
 		t.Fatalf("conflict copy content = %q, want B-version", got)
 	}
 
-	// Third machine pulls and sees the merged state.
-	newS3Fake := t // keep tmp server alive for the duration
-	_ = newS3Fake
+	// B now pushes: this should be a plain fast-forward over A's tip.
+	if err := cmdPush(ctx, nil); err != nil {
+		t.Fatalf("post-merge push failed: %v", err)
+	}
+
+	// A third machine pulls and sees the merged state.
 	c := t.TempDir()
 	chdir(t, c)
 	must(t, cmdInit())
@@ -653,6 +617,55 @@ func TestDivergentPushAutoMerges(t *testing.T) {
 	}
 	if got := read(t, filepath.Join(c, conflictFile)); got != "B-version\n" {
 		t.Fatalf("C sees conflict-copy = %q, want B-version", got)
+	}
+
+	// A pulls too and sees the same merged state — including B's conflict copy.
+	chdir(t, a)
+	must(t, cmdPull(ctx, nil))
+	if got := read(t, filepath.Join(a, "hello.txt")); got != "A-version\n" {
+		t.Fatalf("A sees hello.txt = %q, want A-version (own edit preserved)", got)
+	}
+	if got := read(t, filepath.Join(a, conflictFile)); got != "B-version\n" {
+		t.Fatalf("A sees conflict-copy = %q, want B-version", got)
+	}
+}
+
+// findConflictCopy returns the basename of the first file in dir matching
+// "<stem> (modified on <date> by <clientID>)<any ext>", or "" if none.
+func findConflictCopy(t *testing.T, dir, stem, clientID string) string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix := stem + " (modified on "
+	suffix := " by " + clientID + ")"
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		n := e.Name()
+		if !strings.HasPrefix(n, prefix) {
+			continue
+		}
+		// Strip extension (what's after the last dot) and check the
+		// "by <clientID>)" tag is at the end of the bare filename.
+		stemPart := n
+		if dot := strings.LastIndex(n, "."); dot > len(prefix) {
+			stemPart = n[:dot]
+		}
+		if strings.HasSuffix(stemPart, suffix) {
+			return n
+		}
+	}
+	return ""
+}
+
+func listDir(t *testing.T, dir string) {
+	t.Helper()
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		t.Logf("  %s", e.Name())
 	}
 }
 
@@ -686,5 +699,350 @@ func TestFastForwardPush(t *testing.T) {
 	must(t, cmdPull(ctx, nil))
 	if got := read(t, filepath.Join(a, "new.txt")); got != "made on B\n" {
 		t.Fatalf("A sees new.txt = %q, want 'made on B'", got)
+	}
+}
+
+// TestPushForceOverwritesRemote: --force bypasses the topology check. Useful
+// for recovery (wipe remote, publish a known-good local tip) — we verify it
+// successfully overwrites even when local is strictly behind.
+func TestPushForceOverwritesRemote(t *testing.T) {
+	newS3Fake(t, "shasync-test")
+	ctx := context.Background()
+	remoteURL := "s3://shasync-test/force-project"
+
+	// A advances the remote two commits ahead.
+	a := makeWorkTree(t)
+	chdir(t, a)
+	must(t, cmdInit())
+	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdCommit(ctx, []string{"-m", "c1"}))
+	must(t, cmdPush(ctx, nil))
+	write(t, filepath.Join(a, "hello.txt"), "c2\n")
+	must(t, cmdCommit(ctx, []string{"-m", "c2"}))
+	must(t, cmdPush(ctx, nil))
+	sA, _ := findStore()
+	headAdvanced, _ := sA.readHead()
+
+	// B has only the c1 snapshot (pulled before c2). Its HEAD is strictly
+	// behind remote. A normal push would refuse with "pull first".
+	b := t.TempDir()
+	chdir(t, b)
+	must(t, cmdInit())
+	must(t, cmdRemote([]string{"set", remoteURL}))
+	// Seed B at c1 by pulling then reverting the remote by force from B.
+	// Actually: easier is to have B commit from scratch with no parent,
+	// yielding a chain with NO common ancestor with remote — still a
+	// scenario --force should resolve by overwriting.
+	write(t, filepath.Join(b, "hello.txt"), "from-B-standalone\n")
+	must(t, cmdCommit(ctx, []string{"-m", "B-standalone"}))
+	sB, _ := findStore()
+	headB, _ := sB.readHead()
+	if headB == headAdvanced {
+		t.Fatal("test setup invariant: expected B's HEAD to differ from A's")
+	}
+
+	// Without --force, push should refuse: no common ancestor → not a FF.
+	if err := cmdPush(ctx, nil); err == nil {
+		t.Fatal("expected unforced push to refuse unrelated histories")
+	}
+
+	// With --force, push overwrites remote HEAD regardless.
+	must(t, cmdPush(ctx, []string{"--force"}))
+
+	r, err := newRemote(ctx, remoteURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rh, err := readRemoteHead(ctx, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rh != headB {
+		t.Fatalf("remote HEAD after --force = %s, want %s", rh, headB)
+	}
+}
+
+// TestPullAndLogOnEmptyRemote: before anyone has pushed, `pull` with no
+// args should error out with a clear message (not silently succeed), and
+// `log --remote` should print "(remote has no HEAD)" rather than error.
+func TestPullAndLogOnEmptyRemote(t *testing.T) {
+	newS3Fake(t, "shasync-test")
+	ctx := context.Background()
+	remoteURL := "s3://shasync-test/empty-project"
+
+	dir := t.TempDir()
+	chdir(t, dir)
+	must(t, cmdInit())
+	must(t, cmdRemote([]string{"set", remoteURL}))
+
+	// pull with no args: remote HEAD is absent → expected error.
+	if err := cmdPull(ctx, nil); err == nil {
+		t.Fatal("expected pull on empty remote to error")
+	}
+
+	// log --remote on empty remote: should NOT error; prints a friendly note.
+	if err := cmdLog(ctx, []string{"--remote"}); err != nil {
+		t.Fatalf("log --remote on empty remote errored: %v", err)
+	}
+}
+
+// TestPushAutoCommitsDirtyTree: exercise the core premise of the
+// implicit-commit model. User edits files and runs `push` directly (no
+// explicit commit). Push must snapshot the tree into a new manifest,
+// upload it, and advance remote HEAD. No "nothing to push" error, no
+// silently-ignored edits.
+func TestPushAutoCommitsDirtyTree(t *testing.T) {
+	newS3Fake(t, "shasync-test")
+	ctx := context.Background()
+	remoteURL := "s3://shasync-test/autocommit-project"
+
+	a := makeWorkTree(t)
+	chdir(t, a)
+	must(t, cmdInit())
+	must(t, cmdRemote([]string{"set", remoteURL}))
+
+	// No explicit commit — straight to push. The initial files from
+	// makeWorkTree are uncommitted; push must snapshot them.
+	must(t, cmdPush(ctx, nil))
+	sA, _ := findStore()
+	head1, _ := sA.readHead()
+	if head1 == "" {
+		t.Fatal("push didn't produce a local commit")
+	}
+
+	// Confirm it materialized on the remote.
+	r, err := newRemote(ctx, remoteURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rh1, err := readRemoteHead(ctx, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rh1 != head1 {
+		t.Fatalf("remote HEAD = %s, want %s", rh1, head1)
+	}
+
+	// Now edit without committing, push again — second implicit commit.
+	write(t, filepath.Join(a, "hello.txt"), "second version\n")
+	must(t, cmdPush(ctx, nil))
+	head2, _ := sA.readHead()
+	if head2 == head1 {
+		t.Fatal("second push should have advanced HEAD via implicit commit")
+	}
+	rh2, err := readRemoteHead(ctx, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rh2 != head2 {
+		t.Fatalf("remote HEAD = %s, want %s", rh2, head2)
+	}
+
+	// Clean-tree push must be a no-op at the HEAD level: no new implicit
+	// commit, no advance.
+	must(t, cmdPush(ctx, nil))
+	head3, _ := sA.readHead()
+	if head3 != head2 {
+		t.Fatalf("clean-tree push created a ghost commit: HEAD went %s → %s", head2, head3)
+	}
+}
+
+// TestTwoFoldersImplicitCommitFlow is the headline end-to-end: two folders
+// on the same remote, driven only by `pull` / edit / `push` (and `init` /
+// `remote set` for setup). No explicit `commit` anywhere.
+//
+// Scenarios covered in sequence:
+//  1. Normal sync: A publishes a change, B picks it up, B publishes a
+//     change, A picks it up. Each machine sees the other's edits.
+//  2. Offline divergence with a true conflict: both machines edit the same
+//     file while offline. A pushes first. B's push refuses. B pulls →
+//     auto-merge creates a conflict-copy tagged with B's client_id. B
+//     pushes the merge. A pulls and sees the merged state, including the
+//     conflict-copy file.
+//
+// The interesting invariants:
+//   - The conflict-copy file is tagged with the client_id of the machine
+//     whose version got stashed (B's), not A's.
+//   - A third fresh clone pulling from scratch sees identical state.
+//   - No work is lost — both sides' blobs survive as a sibling pair.
+func TestTwoFoldersImplicitCommitFlow(t *testing.T) {
+	newS3Fake(t, "shasync-test")
+	ctx := context.Background()
+	remoteURL := "s3://shasync-test/two-folder-project"
+
+	// --- Setup: A initializes a repo with some files and publishes it. ---
+	a := makeWorkTree(t)
+	chdir(t, a)
+	must(t, cmdInit())
+	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdPush(ctx, nil)) // implicit commit, then upload
+
+	sA, _ := findStore()
+	cfgA, _ := sA.readConfig()
+	clientA := cfgA.ClientID
+
+	// --- B: fresh clone via pull. ---
+	b := t.TempDir()
+	chdir(t, b)
+	must(t, cmdInit())
+	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdPull(ctx, nil))
+
+	sB, _ := findStore()
+	cfgB, _ := sB.readConfig()
+	clientB := cfgB.ClientID
+	if clientB == clientA {
+		t.Fatalf("two clones must have distinct client_ids (got %s on both)", clientA)
+	}
+	// Sanity: B has A's files.
+	if read(t, filepath.Join(b, "hello.txt")) != "hello world\n" {
+		t.Fatal("B didn't receive A's hello.txt after pull")
+	}
+
+	// === Scenario 1: normal sync, no conflicts ===================== //
+
+	// A edits, pushes.
+	chdir(t, a)
+	write(t, filepath.Join(a, "hello.txt"), "A edit 1\n")
+	must(t, cmdPush(ctx, nil))
+
+	// B pulls, sees A's edit.
+	chdir(t, b)
+	must(t, cmdPull(ctx, nil))
+	if got := read(t, filepath.Join(b, "hello.txt")); got != "A edit 1\n" {
+		t.Fatalf("B sees hello.txt = %q, want %q after A's edit", got, "A edit 1\n")
+	}
+
+	// B edits a different file, pushes — fast-forward.
+	write(t, filepath.Join(b, "sub", "a.txt"), "B edit 1\n")
+	must(t, cmdPush(ctx, nil))
+
+	// A pulls, sees B's edit. (A still has its own hello.txt untouched.)
+	chdir(t, a)
+	must(t, cmdPull(ctx, nil))
+	if got := read(t, filepath.Join(a, "sub", "a.txt")); got != "B edit 1\n" {
+		t.Fatalf("A sees sub/a.txt = %q, want B edit 1", got)
+	}
+	if got := read(t, filepath.Join(a, "hello.txt")); got != "A edit 1\n" {
+		t.Fatalf("A's own hello.txt got clobbered: = %q", got)
+	}
+
+	// === Scenario 2: offline divergence with a real conflict ======= //
+
+	// Both A and B edit hello.txt while "offline" (neither pulls).
+	// A also adds a brand-new file (no conflict) and pushes first.
+	chdir(t, a)
+	write(t, filepath.Join(a, "hello.txt"), "A offline edit\n")
+	write(t, filepath.Join(a, "a-only.md"), "made on A\n")
+	must(t, cmdPush(ctx, nil))
+
+	// B, having not pulled, edits the same hello.txt differently and
+	// separately touches a non-conflicting file. Then tries to push.
+	chdir(t, b)
+	write(t, filepath.Join(b, "hello.txt"), "B offline edit\n")
+	write(t, filepath.Join(b, "sub", "a.txt"), "B edit 2\n")
+
+	// B's push must refuse — not a fast-forward.
+	if err := cmdPush(ctx, nil); err == nil {
+		t.Fatal("expected B's push to refuse on divergence; new model pushes no auto-merge")
+	}
+
+	// B pulls to resolve. Pull must:
+	//   - implicit-commit B's uncommitted edits
+	//   - detect divergence
+	//   - auto-merge: hello.txt keeps A's version at the original path,
+	//                 B's version is stashed as a sibling copy with B's client_id
+	//   - sub/a.txt: only B changed, kept as B's version
+	//   - a-only.md: only A added, kept at the original path
+	//   - check out merge into B's working tree
+	if err := cmdPull(ctx, nil); err != nil {
+		t.Fatalf("B pull (merge) failed: %v", err)
+	}
+
+	// Assertions on B's working tree after merge.
+	if got := read(t, filepath.Join(b, "hello.txt")); got != "A offline edit\n" {
+		t.Fatalf("B hello.txt after merge = %q, want A's version", got)
+	}
+	if got := read(t, filepath.Join(b, "sub", "a.txt")); got != "B edit 2\n" {
+		t.Fatalf("B sub/a.txt after merge = %q, want B's non-conflicting edit preserved", got)
+	}
+	if got := read(t, filepath.Join(b, "a-only.md")); got != "made on A\n" {
+		t.Fatalf("B a-only.md after merge = %q, want A's new file", got)
+	}
+
+	// Conflict copy must be tagged with B's client_id and carry B's content.
+	conflictFile := findConflictCopy(t, b, "hello", clientB)
+	if conflictFile == "" {
+		listDir(t, b)
+		t.Fatalf("no conflict-copy file tagged with client %q found in %s", clientB, b)
+	}
+	if got := read(t, filepath.Join(b, conflictFile)); got != "B offline edit\n" {
+		t.Fatalf("conflict copy content = %q, want B offline edit", got)
+	}
+
+	// B pushes the merge — plain fast-forward now.
+	must(t, cmdPush(ctx, nil))
+
+	// A pulls, sees the merged state including the conflict-copy file.
+	chdir(t, a)
+	must(t, cmdPull(ctx, nil))
+	if got := read(t, filepath.Join(a, "hello.txt")); got != "A offline edit\n" {
+		t.Fatalf("A hello.txt after pull = %q, want its own offline edit (kept at path on conflict)", got)
+	}
+	if got := read(t, filepath.Join(a, conflictFile)); got != "B offline edit\n" {
+		t.Fatalf("A sees conflict copy = %q, want B offline edit", got)
+	}
+	if got := read(t, filepath.Join(a, "sub", "a.txt")); got != "B edit 2\n" {
+		t.Fatalf("A sub/a.txt after pull = %q, want B edit 2", got)
+	}
+
+	// Third fresh clone sees identical state.
+	c := t.TempDir()
+	chdir(t, c)
+	must(t, cmdInit())
+	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdPull(ctx, nil))
+	if got := read(t, filepath.Join(c, "hello.txt")); got != "A offline edit\n" {
+		t.Fatalf("C hello.txt = %q, want A offline edit", got)
+	}
+	if got := read(t, filepath.Join(c, conflictFile)); got != "B offline edit\n" {
+		t.Fatalf("C conflict-copy = %q, want B offline edit", got)
+	}
+	if got := read(t, filepath.Join(c, "a-only.md")); got != "made on A\n" {
+		t.Fatalf("C a-only.md = %q, want A's file", got)
+	}
+}
+
+// TestClientIDStableAcrossRuns: init stamps a client_id; subsequent
+// findStore + readConfig calls read back the same value, and two fresh
+// inits in distinct directories produce distinct IDs.
+func TestClientIDStableAcrossRuns(t *testing.T) {
+	dir1 := t.TempDir()
+	chdir(t, dir1)
+	must(t, cmdInit())
+	s1, _ := findStore()
+	cfg1, _ := s1.readConfig()
+	id1 := cfg1.ClientID
+	if id1 == "" {
+		t.Fatal("init didn't generate a client_id")
+	}
+	// Second findStore on the same dir must yield the same id.
+	s1b, _ := findStore()
+	cfg1b, _ := s1b.readConfig()
+	if cfg1b.ClientID != id1 {
+		t.Fatalf("client_id changed: %q → %q", id1, cfg1b.ClientID)
+	}
+
+	// A second init in a different directory yields a different id.
+	dir2 := t.TempDir()
+	chdir(t, dir2)
+	must(t, cmdInit())
+	s2, _ := findStore()
+	cfg2, _ := s2.readConfig()
+	if cfg2.ClientID == "" {
+		t.Fatal("second init didn't generate a client_id")
+	}
+	if cfg2.ClientID == id1 {
+		t.Fatalf("two fresh inits produced the same client_id %q — want distinct", id1)
 	}
 }

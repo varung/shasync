@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -94,6 +95,43 @@ func (s *Store) writeHead(sha string) error {
 
 type Config struct {
 	Remote string `json:"remote,omitempty"` // gs://bucket/prefix or s3://bucket/prefix
+	// ClientID uniquely identifies this clone of the repo. Generated at init
+	// time and persisted here; used to label conflict-copy files so you can
+	// tell which machine produced the divergent version. Unlike hostname,
+	// it survives laptop renames and doesn't collide across machines with
+	// the same OS-level hostname.
+	ClientID string `json:"client_id,omitempty"`
+}
+
+// newClientID returns 8 hex chars (32 bits of entropy) — enough for a
+// single-user-multi-machine repo where only a handful of clones ever exist.
+func newClientID() (string, error) {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+// ensureClientID loads config and, if ClientID is empty (pre-existing repo
+// or a hand-built config), generates one and writes it back. Returns the ID.
+func (s *Store) ensureClientID() (string, error) {
+	c, err := s.readConfig()
+	if err != nil {
+		return "", err
+	}
+	if c.ClientID != "" {
+		return c.ClientID, nil
+	}
+	id, err := newClientID()
+	if err != nil {
+		return "", err
+	}
+	c.ClientID = id
+	if err := s.writeConfig(c); err != nil {
+		return "", err
+	}
+	return id, nil
 }
 
 func (s *Store) readConfig() (*Config, error) {

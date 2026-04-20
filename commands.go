@@ -25,44 +25,37 @@ func cmdInit() error {
 	if err := initStore(cwd); err != nil {
 		return err
 	}
-	fmt.Printf("initialized %s/ in %s\n", blobsDir, cwd)
+	s, err := findStore()
+	if err != nil {
+		return err
+	}
+	id, err := s.ensureClientID()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("initialized %s/ in %s (client %s)\n", blobsDir, cwd, id)
 	return nil
 }
 
 // --- commit ---
 
-func cmdCommit(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("commit", flag.ExitOnError)
-	msg := fs.String("m", "", "commit message")
-	offline := fs.Bool("offline", false, "skip remote HEAD check (commit without network)")
-	force := fs.Bool("force", false, "commit even if remote is ahead (may diverge)")
-	_ = fs.Parse(args)
-
-	s, err := findStore()
-	if err != nil {
-		return err
-	}
+// snapshotWorkingTree hashes the working tree into a manifest with the
+// given message, writes the manifest if its content differs from local
+// HEAD, and advances local HEAD. Returns (sha, committed):
+//
+//   - (newSHA, true) — a new commit was written (tree had changes).
+//   - (parent, false) — nothing changed; local HEAD is untouched.
+//
+// Implicit commits on push and pull reuse this helper; explicit
+// `shasync commit -m "..."` is now a thin wrapper.
+func snapshotWorkingTree(s *Store, message string) (string, bool, error) {
 	parent, err := s.readHead()
 	if err != nil {
-		return err
+		return "", false, err
 	}
-
-	// Linearity check: when a remote is configured, refuse if remote HEAD is
-	// ahead of local HEAD. The single-user workflow is pull → commit → push;
-	// this catches the common mistake of committing on machine B before
-	// pulling what machine A pushed. --offline skips the network roundtrip;
-	// --force commits anyway and accepts the divergence (push will auto-merge).
-	if !*offline && !*force {
-		if c, _ := s.readConfig(); c != nil && c.Remote != "" {
-			if err := checkRemoteNotAhead(ctx, s, c.Remote, parent); err != nil {
-				return err
-			}
-		}
-	}
-
 	paths, err := s.walkWorkingDir()
 	if err != nil {
-		return err
+		return "", false, err
 	}
 
 	// For unchanged files (same path + size + mtime-ms as parent manifest),
@@ -71,7 +64,7 @@ func cmdCommit(ctx context.Context, args []string) error {
 	if parent != "" {
 		pm, err := s.readManifest(parent)
 		if err != nil {
-			return err
+			return "", false, err
 		}
 		parentFiles = pm.Files
 	}
@@ -123,29 +116,88 @@ func cmdCommit(ctx context.Context, args []string) error {
 	wg.Wait()
 	select {
 	case e := <-errs:
-		return e
+		return "", false, e
 	default:
+	}
+
+	// No-op detection based on file contents, not full-manifest hash:
+	// message + created_at differ between implicit and explicit commits,
+	// so comparing SHAs would incorrectly mark a clean tree as changed.
+	if parent == "" && len(files) == 0 {
+		// Fresh clone, empty working tree — no "ghost empty" commit.
+		return "", false, nil
+	}
+	if parent != "" && manifestFilesEqual(files, parentFiles) {
+		return parent, false, nil
 	}
 
 	m := &Manifest{
 		Version:   ManifestSchemaVersion,
 		ParentSHA: parent,
 		CreatedAt: nowUnixMs(),
-		Message:   *msg,
+		Message:   message,
 		Files:     files,
 	}
 	sha, _, err := s.writeManifest(m)
 	if err != nil {
+		return "", false, err
+	}
+	if err := s.writeHead(sha); err != nil {
+		return "", false, err
+	}
+	return sha, true, nil
+}
+
+func manifestFilesEqual(a, b map[string]*ManifestFile) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, av := range a {
+		bv, ok := b[k]
+		if !ok {
+			return false
+		}
+		if av.SHA != bv.SHA || av.Size != bv.Size || av.Mode != bv.Mode {
+			return false
+		}
+	}
+	return true
+}
+
+// ensureTreeCommitted is the "commit if dirty" step used by push and pull.
+// If the working tree differs from local HEAD, it snapshots with an
+// auto-generated message ("sync from <clientID>") and advances HEAD;
+// otherwise it's a no-op. Returns the (possibly new) HEAD SHA.
+func ensureTreeCommitted(s *Store, clientID string) (string, bool, error) {
+	msg := fmt.Sprintf("sync from %s", clientID)
+	if clientID == "" {
+		msg = "sync"
+	}
+	return snapshotWorkingTree(s, msg)
+}
+
+func cmdCommit(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("commit", flag.ExitOnError)
+	msg := fs.String("m", "", "commit message")
+	_ = fs.Parse(args)
+
+	s, err := findStore()
+	if err != nil {
 		return err
 	}
-	if parent != "" && sha == parent {
+	sha, committed, err := snapshotWorkingTree(s, *msg)
+	if err != nil {
+		return err
+	}
+	if !committed {
 		fmt.Println("nothing to commit — working tree matches HEAD")
 		return nil
 	}
-	if err := s.writeHead(sha); err != nil {
+	m, err := s.readManifest(sha)
+	if err != nil {
 		return err
 	}
-	fmt.Printf("%s  (%d files)\n", sha, len(files))
+	fmt.Printf("%s  (%d files)\n", sha, len(m.Files))
 	return nil
 }
 
@@ -758,23 +810,22 @@ func cmdKey(ctx context.Context, args []string) error {
 
 // --- push ---
 
-// cmdPush synchronizes local HEAD → remote HEAD with a single-parent merge
-// policy suitable for a single user on multiple machines.
+// cmdPush publishes local work to the remote. Conceptually "commit + push":
 //
-// Topology cases (after reading remote HEAD):
-//   - remote unset / equal / ancestor-of-local → fast-forward: upload new
-//     manifests + blobs, set remote HEAD = local HEAD.
-//   - local is ancestor of remote              → refuse; tell user to pull.
-//   - diverged                                 → auto-merge against remote:
-//     non-conflict paths take whichever side changed, conflict paths keep
-//     remote at the original path and stash the local version as a sibling
-//     "<stem> (conflict from <host> <stamp>)<ext>" file. The merge commit's
-//     single parent is remote HEAD, so the local-only branch is orphaned
-//     (acceptable in single-user mode; a future v2 schema could record both).
-//     The working tree is updated to reflect the merge before pushing.
+//  1. Snapshot the working tree if it differs from local HEAD (implicit
+//     commit with an auto-generated message).
+//  2. Read remote HEAD. If it's empty, equal to local HEAD, or an ancestor
+//     of local HEAD → fast-forward: upload new manifests + blobs, rewrite
+//     remote HEAD.
+//  3. Anything else (local behind or diverged) → refuse with a message
+//     telling the user to run `shasync pull` (which will merge if needed).
 //
-// `--force` skips all topology checks and uploads local HEAD as-is (may
+// `--force` skips the topology check and uploads local HEAD as-is (may
 // clobber concurrent work). Required for recovery scenarios.
+//
+// The merge machinery lives in `pull`, not here — push is outbound-only.
+// Its only mutation of local state is the implicit commit; it never
+// mutates the working tree.
 func cmdPush(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("push", flag.ExitOnError)
 	force := fs.Bool("force", false, "push local HEAD without topology check (may overwrite remote)")
@@ -800,6 +851,17 @@ func cmdPush(ctx context.Context, args []string) error {
 		return err
 	}
 
+	// Implicit commit: snapshot the working tree if it's dirty. This is the
+	// step that makes "push" feel like "save everything to the cloud" — you
+	// don't have to have run `commit` first.
+	if fs.NArg() == 0 {
+		if _, committed, err := ensureTreeCommitted(s, c.ClientID); err != nil {
+			return err
+		} else if committed {
+			fmt.Println("(auto-committed working tree before push)")
+		}
+	}
+
 	local, err := s.readHead()
 	if err != nil {
 		return err
@@ -823,7 +885,8 @@ func cmdPush(ctx context.Context, args []string) error {
 		return fmt.Errorf("read remote HEAD: %w", err)
 	}
 
-	// Cases that need no merge: empty remote, equal, or remote is ancestor.
+	// Fast-forward cases: empty remote, pushing the remote tip, or remote is
+	// an ancestor of what we're pushing.
 	if remote == "" || remote == pushSha {
 		return uploadManifestChainAndSetHead(ctx, r, s, cryptKey, pushSha)
 	}
@@ -835,70 +898,10 @@ func cmdPush(ctx context.Context, args []string) error {
 		return uploadManifestChainAndSetHead(ctx, r, s, cryptKey, pushSha)
 	}
 
-	// Need the remote chain locally to reason further.
-	if err := fetchManifestChain(ctx, r, s, cryptKey, remote); err != nil {
-		return err
-	}
-	behind, err := s.isAncestor(pushSha, remote)
-	if err != nil {
-		return err
-	}
-	if behind {
-		return fmt.Errorf("local is behind remote (%s) — run: shasync pull", shortSHA(remote))
-	}
-
-	// Diverged. Auto-merge against remote.
-	if pushSha != local {
-		return fmt.Errorf("auto-merge is only supported for pushing local HEAD (got %s, HEAD=%s)", shortSHA(pushSha), shortSHA(local))
-	}
-	dirty, err := s.hasUncommittedChanges()
-	if err != nil {
-		return err
-	}
-	if dirty {
-		return fmt.Errorf("uncommitted changes — commit or revert before merging")
-	}
-	ancSha, err := s.findCommonAncestor(local, remote)
-	if err != nil {
-		return err
-	}
-	if ancSha == "" {
-		return fmt.Errorf("no common ancestor between local (%s) and remote (%s) — use `shasync push --force` to overwrite, or pull + resolve manually", shortSHA(local), shortSHA(remote))
-	}
-
-	// Download any blobs referenced by the remote chain that we don't have;
-	// the merge manifest may keep some of them at their original paths.
-	if err := fetchBlobsForChain(ctx, r, s, cryptKey, remote, ancSha); err != nil {
-		return err
-	}
-
-	hostname, _ := os.Hostname()
-	if hostname == "" {
-		hostname = "unknown"
-	}
-	mergeManifest, conflicts, err := autoMerge(s, hostname, time.Now(), ancSha, remote, local)
-	if err != nil {
-		return err
-	}
-	mergeSHA, _, err := s.writeManifest(mergeManifest)
-	if err != nil {
-		return err
-	}
-
-	fmt.Printf("diverged — merging local %s into remote %s\n", shortSHA(local), shortSHA(remote))
-	if len(conflicts) > 0 {
-		fmt.Printf("  %d conflict(s) — local versions preserved as sibling copies:\n", len(conflicts))
-		for _, p := range conflicts {
-			fmt.Printf("    C  %s\n", p)
-		}
-	}
-
-	// Materialize the merge into the working tree (updates local HEAD to mergeSHA).
-	if err := checkoutTarget(s, mergeSHA, false); err != nil {
-		return fmt.Errorf("apply merge to working tree: %w", err)
-	}
-
-	return uploadManifestChainAndSetHead(ctx, r, s, cryptKey, mergeSHA)
+	// Not a fast-forward: either we're strictly behind, or we've diverged.
+	// Either way the fix is the same — pull first. `pull` will detect the
+	// case and, on divergence, auto-merge into the working tree.
+	return fmt.Errorf("remote has moved (remote=%s, local=%s) — run: shasync pull", shortSHA(remote), shortSHA(pushSha))
 }
 
 // uploadManifestChainAndSetHead uploads every blob referenced by sha's chain
@@ -960,6 +963,63 @@ func uploadManifestChainAndSetHead(ctx context.Context, r Remote, s *Store, cryp
 	return nil
 }
 
+// doMerge is the divergence-handling step of `pull`: builds a merge manifest
+// whose parent is the remote tip, downloads remote-side blobs the merge may
+// keep at their original paths, and writes the manifest locally. Does NOT
+// touch the working tree or local HEAD — the caller's subsequent checkout
+// is the step that actually mutates the working tree. Returns the merge SHA.
+//
+// Caller MUST have already fetched the remote chain (fetchManifestChain) so
+// findCommonAncestor can walk both sides.
+func doMerge(ctx context.Context, r Remote, s *Store, cryptKey []byte, cfg *Config, local, remote string) (string, error) {
+	dirty, err := s.hasUncommittedChanges()
+	if err != nil {
+		return "", err
+	}
+	if dirty {
+		return "", fmt.Errorf("uncommitted changes — commit or revert before pulling a divergent remote")
+	}
+	ancSHA, err := s.findCommonAncestor(local, remote)
+	if err != nil {
+		return "", err
+	}
+	if ancSHA == "" {
+		return "", fmt.Errorf("no common ancestor between local (%s) and remote (%s) — histories are unrelated; use `shasync push --force` if you intend to overwrite the remote", shortSHA(local), shortSHA(remote))
+	}
+	// The merge manifest can reference remote-only blobs at their original
+	// paths; pull them down before we write the manifest.
+	if err := fetchBlobsForChain(ctx, r, s, cryptKey, remote, ancSHA); err != nil {
+		return "", err
+	}
+
+	clientID := cfg.ClientID
+	if clientID == "" {
+		// Pre-existing repos that predate this field: derive one lazily so
+		// the conflict-copy filename still carries a label.
+		clientID, err = s.ensureClientID()
+		if err != nil {
+			return "", err
+		}
+	}
+	mergeManifest, conflicts, err := autoMerge(s, clientID, time.Now(), ancSHA, remote, local)
+	if err != nil {
+		return "", err
+	}
+	mergeSHA, _, err := s.writeManifest(mergeManifest)
+	if err != nil {
+		return "", err
+	}
+
+	fmt.Printf("diverged — merging local %s into remote %s\n", shortSHA(local), shortSHA(remote))
+	if len(conflicts) > 0 {
+		fmt.Printf("  %d conflict(s) — local versions preserved as sibling copies:\n", len(conflicts))
+		for _, p := range conflicts {
+			fmt.Printf("    C  %s\n", p)
+		}
+	}
+	return mergeSHA, nil
+}
+
 // fetchBlobsForChain downloads any blobs referenced by manifests on the
 // chain from tip back to (but not including) stopAt, if they aren't already
 // local. Used before auto-merge so the merge manifest can reference files
@@ -991,12 +1051,26 @@ func fetchBlobsForChain(ctx context.Context, r Remote, s *Store, cryptKey []byte
 
 // --- pull ---
 
-// cmdPull with no args: read remote HEAD, download its manifest chain +
-// blobs, and check out into the working tree. This is the one-command sync
-// for a fresh clone or a machine that fell behind.
+// cmdPull with no args is the "sync" operation. Conceptually "commit + pull":
 //
-// cmdPull <sha>: download-only (legacy behavior). Leaves local HEAD and the
-// working tree untouched so the caller can inspect or `checkout` separately.
+//  1. Snapshot the working tree if it differs from local HEAD (implicit
+//     commit — so uncommitted work becomes part of the local chain and can
+//     participate in a merge).
+//  2. Read remote HEAD and classify vs (post-commit) local HEAD:
+//     - local empty or == remote         → no-op / plain fetch
+//     - remote is ancestor-of-local      → nothing to do, local is ahead
+//     - local is ancestor-of-remote      → fast-forward: fetch + checkout
+//     - otherwise (diverged)             → build a merge manifest whose
+//       parent is remote tip; files changed on only one side are taken
+//       verbatim; files changed differently on both sides keep the remote
+//       version at the original path and save the local version as a
+//       sibling "<stem> (modified on <date> by <clientID>)<ext>" file. The
+//       merge is checked out into the working tree. A subsequent
+//       `shasync push` becomes a plain fast-forward.
+//
+// cmdPull <sha>: download-only (legacy behavior). No implicit commit, no
+// merge, no working-tree mutation. Leaves local HEAD untouched so the
+// caller can inspect or `checkout` separately.
 func cmdPull(ctx context.Context, args []string) error {
 	s, err := findStore()
 	if err != nil {
@@ -1022,6 +1096,15 @@ func cmdPull(ctx context.Context, args []string) error {
 	checkoutAfter := false
 	switch len(args) {
 	case 0:
+		// Implicit commit: materialize any uncommitted working-tree changes
+		// into a local commit *before* we read the remote. This is what makes
+		// "pull" feel like "sync" — your in-progress edits become the local
+		// side of the three-way merge if it turns out the chains diverged.
+		if _, committed, err := ensureTreeCommitted(s, c.ClientID); err != nil {
+			return err
+		} else if committed {
+			fmt.Println("(auto-committed working tree before pull)")
+		}
 		rh, err := readRemoteHead(ctx, r)
 		if err != nil {
 			return fmt.Errorf("read remote HEAD: %w", err)
@@ -1037,12 +1120,42 @@ func cmdPull(ctx context.Context, args []string) error {
 		return fmt.Errorf("usage: shasync pull [<sha>]")
 	}
 
-	// If we're already at the target and we'd sync, short-circuit.
+	// Divergence detection only applies to the no-arg (sync) mode.
 	if checkoutAfter {
 		local, _ := s.readHead()
 		if local == target {
 			fmt.Printf("already up to date (%s)\n", shortSHA(target))
 			return nil
+		}
+		if local != "" {
+			// Need the full remote chain locally to answer ancestor queries.
+			if err := fetchManifestChain(ctx, r, s, cryptKey, target); err != nil {
+				return err
+			}
+			remoteIsAncestor, err := s.isAncestor(target, local)
+			if err != nil {
+				return err
+			}
+			if remoteIsAncestor {
+				// Local is strictly ahead. Nothing to pull.
+				fmt.Printf("local (%s) is already ahead of remote (%s) — run: shasync push\n", shortSHA(local), shortSHA(target))
+				return nil
+			}
+			localIsAncestor, err := s.isAncestor(local, target)
+			if err != nil {
+				return err
+			}
+			if !localIsAncestor {
+				// True divergence. Build a merge manifest; the rest of the
+				// function will then fetch the merge's blobs + check it out.
+				mergeSHA, err := doMerge(ctx, r, s, cryptKey, c, local, target)
+				if err != nil {
+					return err
+				}
+				target = mergeSHA
+			}
+			// localIsAncestor → plain fast-forward; fall through to the
+			// download-and-checkout path with the original target.
 		}
 	}
 

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
 	"path"
 	"sort"
 	"strings"
@@ -154,10 +153,10 @@ func fetchManifestChain(ctx context.Context, r Remote, s *Store, cryptKey []byte
 //   - remote unchanged vs ancestor → take local
 //   - both changed identically     → same SHA, no conflict
 //   - both changed differently     → conflict: keep remote at path,
-//     add local copy at "<stem> (conflict from <host> <stamp>)<ext>"
+//     add local copy at "<stem> (modified on <date> by <clientID>)<ext>"
 //
 // Returns the built manifest and the list of conflicted original paths.
-func autoMerge(s *Store, hostname string, now time.Time, ancSHA, remoteSHA, localSHA string) (*Manifest, []string, error) {
+func autoMerge(s *Store, clientID string, now time.Time, ancSHA, remoteSHA, localSHA string) (*Manifest, []string, error) {
 	anc, err := s.readManifest(ancSHA)
 	if err != nil {
 		return nil, nil, err
@@ -213,7 +212,7 @@ func autoMerge(s *Store, hostname string, now time.Time, ancSHA, remoteSHA, loca
 				out[p] = r
 			}
 			if l != nil {
-				out[conflictCopyPath(p, hostname, stamp)] = l
+				out[conflictCopyPath(p, clientID, stamp)] = l
 			}
 		}
 	}
@@ -248,17 +247,17 @@ func sameFile(a, b *ManifestFile) bool {
 	return a.SHA == b.SHA
 }
 
-// conflictCopyPath inserts "(conflict from <host> <stamp>)" before the file
-// extension, so a resolved copy sorts next to the original in a directory
-// listing. E.g. "notes/todo.md" → "notes/todo (conflict from laptop 2026-04-20 101530).md".
-func conflictCopyPath(p, hostname, stamp string) string {
+// conflictCopyPath inserts "(modified on <stamp> by <clientID>)" before the
+// file extension, so a resolved copy sorts next to the original in a directory
+// listing. E.g. "notes/todo.md" → "notes/todo (modified on 2026-04-20 101530 by a1b2c3d4).md".
+func conflictCopyPath(p, clientID, stamp string) string {
 	dir, base := path.Split(p)
 	stem, ext := base, ""
 	if dot := strings.LastIndex(base, "."); dot > 0 {
 		stem = base[:dot]
 		ext = base[dot:]
 	}
-	return dir + fmt.Sprintf("%s (conflict from %s %s)%s", stem, hostname, stamp, ext)
+	return dir + fmt.Sprintf("%s (modified on %s by %s)%s", stem, stamp, clientID, ext)
 }
 
 func shortSHA(s string) string {
@@ -268,61 +267,3 @@ func shortSHA(s string) string {
 	return s
 }
 
-// --- commit-time linearity check -----------------------------------------
-
-// checkRemoteNotAhead refuses the commit if remote HEAD is ahead of local
-// HEAD or has diverged. Tolerates remote being unreachable (prints a warning
-// and proceeds) so offline commits Just Work without flags when the network
-// is genuinely down.
-//
-// Policy:
-//   - remote HEAD unset           → ok (no baseline yet)
-//   - remote HEAD == local HEAD   → ok (at tip)
-//   - remote HEAD is ancestor of local HEAD → ok (we are ahead)
-//   - local HEAD is ancestor of remote HEAD → refuse (we are behind)
-//   - neither is ancestor         → refuse (diverged)
-//
-// Fetches remote HEAD's manifest chain (metadata only, no blobs) so ancestor
-// queries have enough locally to answer authoritatively.
-func checkRemoteNotAhead(ctx context.Context, s *Store, remoteURL, localHead string) error {
-	r, err := newRemote(ctx, remoteURL)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: couldn't reach remote (%v) — committing offline\n", err)
-		return nil
-	}
-	remoteHead, err := readRemoteHead(ctx, r)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: couldn't read remote HEAD (%v) — committing offline\n", err)
-		return nil
-	}
-	if remoteHead == "" || remoteHead == localHead {
-		return nil
-	}
-	if localHead == "" {
-		return fmt.Errorf("remote has commits but local HEAD is empty — run: shasync pull")
-	}
-	cryptKey, err := s.loadKey()
-	if err != nil {
-		return err
-	}
-	if err := fetchManifestChain(ctx, r, s, cryptKey, remoteHead); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: couldn't fetch remote chain (%v) — committing offline\n", err)
-		return nil
-	}
-	// Is remote an ancestor of local? Then local is ahead — allowed.
-	ahead, err := s.isAncestor(remoteHead, localHead)
-	if err != nil {
-		return err
-	}
-	if ahead {
-		return nil
-	}
-	behind, err := s.isAncestor(localHead, remoteHead)
-	if err != nil {
-		return err
-	}
-	if behind {
-		return fmt.Errorf("remote has new commits (%s) — run: shasync pull  (or: shasync commit --offline)", shortSHA(remoteHead))
-	}
-	return fmt.Errorf("remote has diverged (remote=%s, local=%s) — run: shasync pull  (or: shasync commit --offline to fork; push will auto-merge)", shortSHA(remoteHead), shortSHA(localHead))
-}
