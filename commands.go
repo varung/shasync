@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -236,12 +237,12 @@ func checkoutTarget(s *Store, target string, force bool) error {
 		return err
 	}
 	if !force {
-		dirty, err := s.hasUncommittedChanges()
+		added, modified, removed, err := s.uncommittedChanges()
 		if err != nil {
 			return err
 		}
-		if dirty {
-			return fmt.Errorf("working tree has uncommitted changes — commit first or pass --force")
+		if len(added)+len(modified)+len(removed) > 0 {
+			return fmt.Errorf("working tree has uncommitted changes — commit first or pass --force\n%s", formatChanges(added, modified, removed))
 		}
 	}
 	var missing []string
@@ -319,28 +320,13 @@ func pruneEmptyDirs(root string) {
 	}
 }
 
-// hasUncommittedChanges compares the working tree against HEAD manifest using
-// path + size + mtime-ms (fast, no hashing). Returns true if anything differs.
-func (s *Store) hasUncommittedChanges() (bool, error) {
-	head, err := s.readHead()
-	if err != nil {
-		return false, err
-	}
-	if head == "" {
-		// No HEAD: dirty iff any tracked files exist.
-		paths, err := s.walkWorkingDir()
-		if err != nil {
-			return false, err
-		}
-		return len(paths) > 0, nil
-	}
-	hm, err := s.readManifest(head)
-	if err != nil {
-		return false, err
-	}
+// diffWorkingTree compares the working tree against headFiles and returns
+// lists of added, modified, and removed paths. Uses size + mtime for fast
+// filtering, then confirms with hash when those differ.
+func (s *Store) diffWorkingTree(headFiles map[string]*ManifestFile) (added, modified, removed []string, err error) {
 	paths, err := s.walkWorkingDir()
 	if err != nil {
-		return false, err
+		return nil, nil, nil, err
 	}
 	seen := make(map[string]bool, len(paths))
 	for _, rel := range paths {
@@ -348,22 +334,76 @@ func (s *Store) hasUncommittedChanges() (bool, error) {
 		abs := filepath.Join(s.Root, filepath.FromSlash(rel))
 		st, err := os.Stat(abs)
 		if err != nil {
-			return true, nil
+			return nil, nil, nil, err
 		}
-		prev, ok := hm.Files[rel]
+		prev, ok := headFiles[rel]
 		if !ok {
-			return true, nil
+			added = append(added, rel)
+			continue
 		}
 		if prev.Size != st.Size() || prev.UpdatedAt != st.ModTime().UnixMilli() {
-			return true, nil
+			// Confirm with hash before declaring modified.
+			sha, _, err := hashFile(abs)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			if sha != prev.SHA {
+				modified = append(modified, rel)
+			}
 		}
 	}
-	for p := range hm.Files {
+	for p := range headFiles {
 		if !seen[p] {
-			return true, nil
+			removed = append(removed, p)
 		}
 	}
-	return false, nil
+	return added, modified, removed, nil
+}
+
+// uncommittedChanges returns the lists of uncommitted changes vs HEAD.
+// Returns empty slices if the working tree is clean.
+func (s *Store) uncommittedChanges() (added, modified, removed []string, err error) {
+	head, err := s.readHead()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if head == "" {
+		// No HEAD: all files are "added".
+		paths, err := s.walkWorkingDir()
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		return paths, nil, nil, nil
+	}
+	hm, err := s.readManifest(head)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return s.diffWorkingTree(hm.Files)
+}
+
+// hasUncommittedChanges returns true if the working tree differs from HEAD.
+func (s *Store) hasUncommittedChanges() (bool, error) {
+	added, modified, removed, err := s.uncommittedChanges()
+	if err != nil {
+		return false, err
+	}
+	return len(added)+len(modified)+len(removed) > 0, nil
+}
+
+// formatChanges returns a formatted string of A/M/D changes, one per line.
+func formatChanges(added, modified, removed []string) string {
+	var lines []string
+	for _, p := range added {
+		lines = append(lines, fmt.Sprintf("  A  %s", p))
+	}
+	for _, p := range modified {
+		lines = append(lines, fmt.Sprintf("  M  %s", p))
+	}
+	for _, p := range removed {
+		lines = append(lines, fmt.Sprintf("  D  %s", p))
+	}
+	return strings.Join(lines, "\n")
 }
 
 // --- status ---
@@ -387,55 +427,19 @@ func cmdStatus() error {
 		fmt.Printf("HEAD %s\n", head)
 	} else {
 		fmt.Println("HEAD (none)")
+		headFiles = make(map[string]*ManifestFile)
 	}
-	paths, err := s.walkWorkingDir()
+	added, modified, removed, err := s.diffWorkingTree(headFiles)
 	if err != nil {
 		return err
-	}
-	seen := make(map[string]bool)
-	var added, modified, removed []string
-	for _, rel := range paths {
-		seen[rel] = true
-		abs := filepath.Join(s.Root, filepath.FromSlash(rel))
-		st, err := os.Stat(abs)
-		if err != nil {
-			return err
-		}
-		prev, ok := headFiles[rel]
-		if !ok {
-			added = append(added, rel)
-			continue
-		}
-		if prev.Size != st.Size() || prev.UpdatedAt != st.ModTime().UnixMilli() {
-			// Confirm with hash before declaring modified.
-			sha, _, err := hashFile(abs)
-			if err != nil {
-				return err
-			}
-			if sha != prev.SHA {
-				modified = append(modified, rel)
-			}
-		}
-	}
-	for p := range headFiles {
-		if !seen[p] {
-			removed = append(removed, p)
-		}
 	}
 	sort.Strings(added)
 	sort.Strings(modified)
 	sort.Strings(removed)
-	for _, p := range added {
-		fmt.Printf("  A  %s\n", p)
-	}
-	for _, p := range modified {
-		fmt.Printf("  M  %s\n", p)
-	}
-	for _, p := range removed {
-		fmt.Printf("  D  %s\n", p)
-	}
 	if len(added)+len(modified)+len(removed) == 0 {
 		fmt.Println("clean")
+	} else {
+		fmt.Println(formatChanges(added, modified, removed))
 	}
 	return nil
 }
@@ -564,6 +568,164 @@ func diffManifestFiles(parent, cur map[string]*ManifestFile) (added, modified, r
 	sort.Strings(modified)
 	sort.Strings(removed)
 	return
+}
+
+// --- diff ---
+
+// cmdDiff prints a unified diff of file changes between two manifests.
+// With one arg, compares <sha> against its parent (the commit view). With
+// two args, compares <old> against <new>. Shells out to diff(1) pointing
+// at the local object store, so blobs must already be present (pull first
+// if needed). Added/removed files diff against /dev/null, matching git's
+// convention, so tools like `delta` render them correctly.
+func cmdDiff(args []string) error {
+	fs := flag.NewFlagSet("diff", flag.ExitOnError)
+	_ = fs.Parse(args)
+	rest := fs.Args()
+
+	s, err := findStore()
+	if err != nil {
+		return err
+	}
+
+	var oldSHA, newSHA string
+	switch len(rest) {
+	case 1:
+		newSHA = rest[0]
+		m, err := s.readManifest(newSHA)
+		if err != nil {
+			return err
+		}
+		oldSHA = m.ParentSHA
+	case 2:
+		oldSHA, newSHA = rest[0], rest[1]
+	default:
+		return fmt.Errorf("usage: shasync diff <sha> | shasync diff <old-sha> <new-sha>")
+	}
+
+	newM, err := s.readManifest(newSHA)
+	if err != nil {
+		return err
+	}
+	var oldFiles map[string]*ManifestFile
+	if oldSHA != "" {
+		oldM, err := s.readManifest(oldSHA)
+		if err != nil {
+			return err
+		}
+		oldFiles = oldM.Files
+	}
+
+	added, modified, removed := diffManifestFiles(oldFiles, newM.Files)
+
+	emit := func(path, oldPath, newPath, oldLabel, newLabel string) error {
+		fmt.Printf("diff --shasync a/%s b/%s\n", path, path)
+		cmd := exec.Command("diff", "-u",
+			"--label", oldLabel, "--label", newLabel,
+			oldPath, newPath)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			// diff(1) exits 1 when files differ — expected case.
+			if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 {
+				return nil
+			}
+			return fmt.Errorf("diff %s: %w", path, err)
+		}
+		return nil
+	}
+
+	for _, p := range added {
+		if err := emit(p, os.DevNull, s.objectPath(newM.Files[p].SHA), "/dev/null", "b/"+p); err != nil {
+			return err
+		}
+	}
+	for _, p := range modified {
+		if err := emit(p, s.objectPath(oldFiles[p].SHA), s.objectPath(newM.Files[p].SHA), "a/"+p, "b/"+p); err != nil {
+			return err
+		}
+	}
+	for _, p := range removed {
+		if err := emit(p, s.objectPath(oldFiles[p].SHA), os.DevNull, "a/"+p, "/dev/null"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// --- browse ---
+
+// cmdBrowse launches an interactive commit browser using fzf. It pipes
+// `shasync log --summary` into fzf as the candidate list, uses fzf's
+// --preview to show the diff of the highlighted commit in the right pane,
+// and binds Enter to open the full diff in a pager. If `delta` is on PATH,
+// it's used to syntax-highlight the diff; otherwise plain diff + less.
+//
+// fzf talks to /dev/tty directly, so piping stdin into it is fine — we're
+// only using stdin to feed the candidate list.
+func cmdBrowse(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("browse", flag.ExitOnError)
+	n := fs.Int("n", 500, "max commits to load")
+	_ = fs.Parse(args)
+
+	if _, err := exec.LookPath("fzf"); err != nil {
+		return fmt.Errorf("fzf not found in PATH — install it (e.g. `brew install fzf`)")
+	}
+
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	selfQ := shellSingleQuote(self)
+
+	var preview, enter string
+	if _, err := exec.LookPath("delta"); err == nil {
+		preview = selfQ + " diff {1} | delta --paging never"
+		enter = selfQ + " diff {1} | delta"
+	} else {
+		preview = selfQ + " diff {1}"
+		enter = selfQ + " diff {1} | less -R"
+	}
+
+	logCmd := exec.Command(self, "log", "--summary", "-n", fmt.Sprintf("%d", *n))
+	logOut, err := logCmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	logCmd.Stderr = os.Stderr
+	if err := logCmd.Start(); err != nil {
+		return err
+	}
+
+	fzfCmd := exec.Command("fzf",
+		"--ansi",
+		"--preview", preview,
+		"--preview-window=right:65%",
+		"--bind", "enter:execute("+enter+")",
+	)
+	fzfCmd.Stdin = logOut
+	fzfCmd.Stdout = os.Stdout
+	fzfCmd.Stderr = os.Stderr
+	runErr := fzfCmd.Run()
+	_ = logCmd.Wait() // log may have taken SIGPIPE when fzf closed its stdin; ignore.
+	if runErr != nil {
+		if ee, ok := runErr.(*exec.ExitError); ok {
+			// fzf exits 130 on esc/ctrl-c and 1 when no match is made — both are normal.
+			if code := ee.ExitCode(); code == 130 || code == 1 {
+				return nil
+			}
+		}
+		return runErr
+	}
+	return nil
+}
+
+// shellSingleQuote wraps s in single quotes, escaping any embedded single
+// quotes, so it's safe to drop into a shell command line built by string
+// concatenation. Needed because fzf passes --preview and execute(...) args
+// through `$SHELL -c`.
+func shellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // --- info ---
@@ -972,12 +1134,12 @@ func uploadManifestChainAndSetHead(ctx context.Context, r Remote, s *Store, cryp
 // Caller MUST have already fetched the remote chain (fetchManifestChain) so
 // findCommonAncestor can walk both sides.
 func doMerge(ctx context.Context, r Remote, s *Store, cryptKey []byte, cfg *Config, local, remote string) (string, error) {
-	dirty, err := s.hasUncommittedChanges()
+	added, modified, removed, err := s.uncommittedChanges()
 	if err != nil {
 		return "", err
 	}
-	if dirty {
-		return "", fmt.Errorf("uncommitted changes — commit or revert before pulling a divergent remote")
+	if len(added)+len(modified)+len(removed) > 0 {
+		return "", fmt.Errorf("uncommitted changes — commit or revert before pulling a divergent remote\n%s", formatChanges(added, modified, removed))
 	}
 	ancSHA, err := s.findCommonAncestor(local, remote)
 	if err != nil {
@@ -1207,6 +1369,9 @@ func cmdPull(ctx context.Context, args []string) error {
 	}
 
 	// Sync flow: also check out and update local HEAD.
+	// Note: force=false is technically redundant since ensureTreeCommitted already
+	// ran at the start of pull. We keep the check as a safety net in case
+	// ensureTreeCommitted has a bug. To speed things up, change to force=true.
 	if err := checkoutTarget(s, target, false); err != nil {
 		return fmt.Errorf("%w\n(fetched %d blob(s); re-run `shasync checkout %s` once the working tree is clean)", err, len(need), target)
 	}

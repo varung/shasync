@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# shasync-browse — interactive commit browser backed by shasync + fzf.
+#
+# Arrow keys or Ctrl-j/Ctrl-k navigate, type to fuzzy-filter, Enter opens
+# the full diff in a pager, Esc quits. If `delta` is installed, diffs are
+# syntax-highlighted.
+#
+# Equivalent to `shasync browse`, but kept as a shell script so you can
+# tweak the preview command, keybindings, or pager without rebuilding.
+#
+# Env overrides:
+#   SHASYNC_BROWSE_N   max commits to load (default 500)
+
+set -euo pipefail
+
+command -v fzf >/dev/null 2>&1 || {
+  echo "fzf not found in PATH (try: brew install fzf)" >&2
+  exit 2
+}
+
+if command -v delta >/dev/null 2>&1; then
+  preview='shasync diff {1} | delta --paging never'
+  enter='shasync diff {1} | delta'
+else
+  preview='shasync diff {1}'
+  enter='shasync diff {1} | less -R'
+fi
+
+shasync log --summary -n "${SHASYNC_BROWSE_N:-500}" \
+  | fzf --ansi \
+        --preview "$preview" \
+        --preview-window=right:65% \
+        --bind "enter:execute($enter)"

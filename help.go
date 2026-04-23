@@ -25,6 +25,8 @@ COMMANDS
   checkout <sha> [--force]      reflink files from manifest <sha> into the dir
   status                        show changes vs HEAD
   log [-n <count>] [--remote]   walk the manifest chain with dates + file diffs
+  diff <sha> [<sha2>]           unified diff: <sha> vs its parent (or vs <sha2>)
+  browse [-n <count>]           interactive commit browser (requires fzf)
   info                          summary: repo, HEAD, remote, encryption, counts
   head                          print the HEAD manifest SHA
   remote set <url>              configure remote (gs://... or s3://...)

@@ -28,6 +28,10 @@ func main() {
 		err = cmdStatus()
 	case "log":
 		err = cmdLog(ctx, os.Args[2:])
+	case "diff":
+		err = cmdDiff(os.Args[2:])
+	case "browse":
+		err = cmdBrowse(ctx, os.Args[2:])
 	case "info":
 		err = cmdInfo()
 	case "head":
