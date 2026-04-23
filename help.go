@@ -26,7 +26,9 @@ COMMANDS
   status                        show changes vs HEAD
   log [-n <count>] [--remote]   walk the manifest chain with dates + file diffs
   diff <sha> [<sha2>]           unified diff: <sha> vs its parent (or vs <sha2>)
-  browse [-n <count>]           interactive commit browser (requires fzf)
+                                pipe through "delta" for syntax highlighting
+  browse [-n <count>]           interactive commit browser (requires fzf;
+                                uses delta for highlighting if installed)
   info                          summary: repo, HEAD, remote, encryption, counts
   head                          print the HEAD manifest SHA
   remote set <url>              configure remote (gs://... or s3://...)
@@ -48,6 +50,21 @@ HELP TOPICS
   ssh               syncing two machines over SSH with rsync
   ignore            the .blobsignore file
   encryption        encrypting blobs and manifests on the remote
+
+OPTIONAL HELPERS
+
+shasync works with no external dependencies, but two tools make the
+"diff" and "browse" commands much nicer:
+
+  fzf    required by "shasync browse" (interactive commit picker).
+         macOS:  brew install fzf
+         Linux:  apt install fzf   (or: https://github.com/junegunn/fzf)
+
+  delta  optional; adds syntax highlighting to "diff" and "browse".
+         macOS:  brew install git-delta
+         Linux:  apt install git-delta   (or: https://github.com/dandavison/delta)
+
+If either is on $PATH, shasync picks it up automatically — no config.
 
 For a short command reference, run:  shasync --help
 For a deep dive on a topic, run:     shasync help <topic>
