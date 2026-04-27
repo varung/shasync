@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"testing"
@@ -378,6 +380,45 @@ func TestFindCommonAncestor(t *testing.T) {
 	// Linear history (no fork): ancestor is the older one.
 	if got, _ := s.findCommonAncestor(r1, r2); got != r1 {
 		t.Fatalf("linear common ancestor = %s, want %s", shortSHA(got), shortSHA(r1))
+	}
+}
+
+// --- copy-on-write -------------------------------------------------------
+
+func TestCopyOnWrite(t *testing.T) {
+	dir := t.TempDir()
+	original := filepath.Join(dir, "original")
+	clone := filepath.Join(dir, "clone")
+	content := []byte("shasync copy-on-write test — this content must survive cloning\n")
+
+	if err := os.WriteFile(original, content, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if err := cloneOrCopyFile(original, clone); err != nil {
+		t.Fatalf("cloneOrCopyFile: %v", err)
+	}
+
+	got, err := os.ReadFile(clone)
+	if err != nil {
+		t.Fatalf("read clone: %v", err)
+	}
+	if string(got) != string(content) {
+		t.Fatalf("clone content mismatch: got %q", got)
+	}
+
+	if err := os.Chmod(clone, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(clone, []byte("MODIFIED\n"), 0o644); err != nil {
+		t.Fatalf("write to clone: %v", err)
+	}
+
+	after, err := os.ReadFile(original)
+	if err != nil {
+		t.Fatalf("re-read original: %v", err)
+	}
+	if string(after) != string(content) {
+		t.Fatalf("original was mutated after writing to clone: got %q", after)
 	}
 }
 

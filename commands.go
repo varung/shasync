@@ -768,6 +768,8 @@ func cmdInfo() error {
 		fmt.Printf("remote:     %s\n", c.Remote)
 	}
 
+	fmt.Println("compress:   zstd")
+
 	envKey := strings.TrimSpace(os.Getenv("SHASYNC_KEY")) != ""
 	_, keyStatErr := os.Stat(s.keyPath())
 	fileKey := keyStatErr == nil
@@ -843,6 +845,56 @@ func cmdHead() error {
 	} else {
 		fmt.Println(h)
 	}
+	return nil
+}
+
+// --- test-cow ---
+
+func cmdTestCOW() error {
+	dir, err := os.MkdirTemp("", "shasync-cow-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+
+	original := filepath.Join(dir, "original")
+	clone := filepath.Join(dir, "clone")
+	content := []byte("shasync copy-on-write test — this content must survive cloning\n")
+
+	if err := os.WriteFile(original, content, 0o444); err != nil {
+		return err
+	}
+
+	if err := cloneOrCopyFile(original, clone); err != nil {
+		return fmt.Errorf("cloneOrCopyFile failed: %w", err)
+	}
+
+	// Verify clone matches original.
+	got, err := os.ReadFile(clone)
+	if err != nil {
+		return fmt.Errorf("read clone: %w", err)
+	}
+	if string(got) != string(content) {
+		return fmt.Errorf("clone content mismatch: got %q", got)
+	}
+
+	// Mutate the clone and verify original is untouched.
+	if err := os.Chmod(clone, 0o644); err != nil {
+		return err
+	}
+	if err := os.WriteFile(clone, []byte("MODIFIED\n"), 0o644); err != nil {
+		return fmt.Errorf("write to clone: %w", err)
+	}
+
+	after, err := os.ReadFile(original)
+	if err != nil {
+		return fmt.Errorf("re-read original: %w", err)
+	}
+	if string(after) != string(content) {
+		return fmt.Errorf("FAIL: original was mutated after writing to clone\n  expected: %q\n  got:      %q", content, after)
+	}
+
+	fmt.Println("ok — copy-on-write works: clone was modified, original is intact")
 	return nil
 }
 
@@ -1388,9 +1440,8 @@ func downloadBlob(ctx context.Context, r Remote, s *Store, cryptKey []byte, sha 
 	return downloadAndStore(ctx, r, cryptKey, remoteBlobKey(sha), s.objectPath(sha), sha)
 }
 
-// uploadLocalFile uploads localPath under remoteKey. If cryptKey != nil the
-// file contents are AES-256-GCM encrypted in memory before upload. Skips the
-// PUT if the remote key already exists.
+// uploadLocalFile zstd-compresses localPath, optionally encrypts (if cryptKey
+// != nil), and uploads under remoteKey. Skips if the key already exists.
 func uploadLocalFile(ctx context.Context, r Remote, cryptKey []byte, localPath, remoteKey string) error {
 	ok, err := r.Exists(ctx, remoteKey)
 	if err != nil {
@@ -1404,23 +1455,26 @@ func uploadLocalFile(ctx context.Context, r Remote, cryptKey []byte, localPath, 
 		return err
 	}
 	defer f.Close()
-	if cryptKey == nil {
-		return r.Upload(ctx, remoteKey, f)
-	}
-	plaintext, err := io.ReadAll(f)
+	data, err := io.ReadAll(f)
 	if err != nil {
 		return err
 	}
-	ct, err := encryptBytes(cryptKey, plaintext)
+	data, err = compressZstd(data)
 	if err != nil {
 		return err
 	}
-	return r.Upload(ctx, remoteKey, bytes.NewReader(ct))
+	if cryptKey != nil {
+		data, err = encryptBytes(cryptKey, data)
+		if err != nil {
+			return err
+		}
+	}
+	return r.Upload(ctx, remoteKey, bytes.NewReader(data))
 }
 
-// downloadAndStore fetches remoteKey, optionally decrypts, verifies SHA
-// (when a key is in use — we already have the plaintext in memory), and
-// writes to dst atomically at mode 0444.
+// downloadAndStore fetches remoteKey, decrypts if the content starts with
+// SHAS magic, decompresses if it starts with zstd magic, verifies the
+// plaintext SHA, and writes to dst atomically at mode 0444.
 func downloadAndStore(ctx context.Context, r Remote, cryptKey []byte, remoteKey, dst, sha string) error {
 	rc, err := r.Download(ctx, remoteKey)
 	if err != nil {
@@ -1430,19 +1484,24 @@ func downloadAndStore(ctx context.Context, r Remote, cryptKey []byte, remoteKey,
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
-	if cryptKey == nil {
-		return streamToFile(rc, dst, 0o444)
-	}
-	ct, err := io.ReadAll(rc)
+	data, err := io.ReadAll(rc)
 	if err != nil {
 		return err
 	}
-	pt, err := decryptBytes(cryptKey, ct)
-	if err != nil {
+	if cryptKey != nil && len(data) >= 5 && (string(data[:5]) == cryptMagicV2 || string(data[:5]) == cryptMagicV1) {
+		data, err = decryptBytes(cryptKey, data)
+		if err != nil {
+			return fmt.Errorf("%s: %w", remoteKey, err)
+		}
+	}
+	if isZstd(data) {
+		data, err = decompressZstd(data)
+		if err != nil {
+			return fmt.Errorf("%s: decompress: %w", remoteKey, err)
+		}
+	}
+	if err := verifyPlaintextSHA(data, sha); err != nil {
 		return fmt.Errorf("%s: %w", remoteKey, err)
 	}
-	if err := verifyPlaintextSHA(pt, sha); err != nil {
-		return fmt.Errorf("%s: %w", remoteKey, err)
-	}
-	return writeFileAtomic(dst, pt, 0o444)
+	return writeFileAtomic(dst, data, 0o444)
 }

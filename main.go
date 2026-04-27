@@ -44,6 +44,10 @@ func main() {
 		err = cmdPull(ctx, os.Args[2:])
 	case "key":
 		err = cmdKey(ctx, os.Args[2:])
+	case "watch":
+		err = cmdWatch(ctx, os.Args[2:])
+	case "test-cow":
+		err = cmdTestCOW()
 	case "-h", "--help":
 		fmt.Print(mainHelp)
 		return

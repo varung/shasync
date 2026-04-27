@@ -36,14 +36,20 @@ COMMANDS
   push [<sha>] [--force]        upload + update remote HEAD; auto-merges forks
   pull [<sha>]                  no arg: sync working tree to remote HEAD;
                                 with arg: download only (run checkout after)
+  watch [--debounce <dur>]      auto-sync on file changes (foreground daemon)
+        [--poll <dur>]          debounce: quiet period (default 2s)
+                                poll: remote check interval (default 30s)
   key gen                       generate a random 32-byte repo encryption key
   key set-passphrase            derive a key from a passphrase via Argon2id
   key show                      print the configured encryption key (or "none")
+  test-cow                      verify copy-on-write (reflink) works
   help <topic>                  show detailed help on a topic
 
 HELP TOPICS
   getting-started   quickstart: init, commit, checkout, log
   workflow          multi-machine sync: pull → commit → push, auto-merge
+  watch             auto-sync daemon mode
+  compression       zstd compression for remote objects
   architecture      full system overview: layout, commands, data flow
   s3                using an S3 remote (including credentials)
   gcs               using a Google Cloud Storage remote (including credentials)
@@ -666,6 +672,66 @@ The remote HEAD pointer is plaintext either way — it's a SHA that names
 a manifest object; the manifest itself is encrypted if a key is set.
 `
 
+const watchHelp = `WATCH — auto-sync on file changes
+
+  shasync watch [--debounce <duration>] [--poll <duration>]
+
+Runs in the foreground and monitors the working tree for changes. When
+files are modified (after a quiet debounce period), shasync automatically
+commits, pulls (with auto-merge if another machine pushed), and pushes.
+
+FLAGS
+
+  --debounce <duration>   Time to wait after the last file change before
+                          syncing. Default: 2s. Prevents rapid-fire syncs
+                          while you're actively editing.
+  --poll <duration>       How often to check the remote for changes from
+                          other machines, even if no local files changed.
+                          Default: 30s.
+
+BEHAVIOR
+
+  1. On startup, performs an initial sync.
+  2. Watches all files under the repo root (respects .blobsignore).
+  3. When a file changes: waits for the debounce period, then syncs.
+  4. Every poll interval: syncs (picks up remote changes).
+  5. Ctrl-C to stop.
+
+The sync cycle is: commit → pull (auto-merge if diverged) ��� push.
+Conflicts are resolved Dropbox-style — both versions are kept, with the
+local copy renamed to include a timestamp and client ID.
+
+EXAMPLE
+
+  shasync watch                        # defaults: 2s debounce, 30s poll
+  shasync watch --debounce 5s --poll 1m
+`
+
+const compressionHelp = `COMPRESSION — zstd compression for remote objects
+
+All blobs and manifests are zstd-compressed before upload. This is always
+on — there is no configuration knob. zstd handles incompressible data
+(images, already-compressed files) gracefully: it detects high-entropy
+blocks and stores them as literals with ~12 bytes of framing overhead.
+
+DETECTION
+
+  On download, the format is auto-detected by magic bytes:
+
+    SHAS2 / SHAS1 header  →  decrypt first, then check again
+    zstd magic (0xFD2FB528) →  decompress
+    neither               →  raw plaintext (legacy uncompressed blob)
+
+  Remote keys are always "blobs/<sha>" and "manifests/<sha>" — no suffix.
+  The content is self-describing, so old uncompressed blobs and new
+  compressed blobs coexist transparently in the same bucket.
+
+PIPELINE
+
+  Upload:  plaintext → zstd compress → [AES-256-GCM encrypt] → upload
+  Download: download → [detect + decrypt] → [detect + decompress] → plaintext
+`
+
 var helpTopics = map[string]string{
 	"getting-started": gettingStartedHelp,
 	"quickstart":      gettingStartedHelp,
@@ -685,6 +751,10 @@ var helpTopics = map[string]string{
 	"encrypt":         encryptionHelp,
 	"key":             encryptionHelp,
 	"passphrase":      encryptionHelp,
+	"watch":           watchHelp,
+	"daemon":          watchHelp,
+	"compression":     compressionHelp,
+	"zstd":            compressionHelp,
 }
 
 func cmdHelp(args []string) error {
