@@ -1,10 +1,40 @@
 # shasync
 
-Content-addressed folder snapshots — a tiny alternative to git for the
-"keep a folder in sync across N machines" use case. Each snapshot is a
-manifest (a map of path → SHA-256) plus a pile of content-addressed
-blobs. No server is required: sync via S3/GCS, or via plain rsync over
-SSH.
+**Open-source Dropbox that runs on your own cloud storage.**
+
+shasync keeps a folder in sync across all your machines using S3 or GCS
+as the backend. No proprietary server, no monthly fee, no storage limits
+beyond what your bucket allows. It's a single binary with no dependencies.
+
+- **Dropbox-style auto-sync** — `shasync watch` monitors your files and
+  syncs changes in the background, including auto-merging edits from
+  other machines
+- **Works with any cloud** — bring your own S3 bucket (AWS, Cloudflare R2,
+  MinIO, etc.) or GCS bucket. One bucket can host many projects.
+- **End-to-end encrypted** — optional AES-256-GCM encryption. Your cloud
+  provider never sees plaintext. Key never leaves your machines.
+- **Handles large files natively** — no git-lfs needed. Copy-on-write
+  reflinks (APFS, Btrfs, XFS) mean a 5GB video takes no extra disk space
+  in the local object store. Commit and checkout are near-instant for
+  unchanged files.
+- **Full version history** — every snapshot is a content-addressed manifest
+  with a parent pointer. Browse, diff, and restore old versions.
+- **Conflict resolution that never blocks you** — when two machines edit the
+  same file, both versions are kept. The remote version stays at the
+  original path; your local version is saved as a timestamped sibling
+  (like Dropbox does). No merge conflicts to resolve manually. Ever.
+
+## Why not just use...
+
+| | shasync | Dropbox/Drive | git | git-lfs | rsync |
+|---|---|---|---|---|---|
+| Self-hosted on your cloud | yes | no | sort of | sort of | yes |
+| Auto-sync / watch mode | yes | yes | no | no | no |
+| Large binary files | yes (COW) | yes | no | yes | yes |
+| Version history | yes | limited | yes | yes | no |
+| E2E encryption | yes | no | no | no | no |
+| Offline conflict merge | automatic | automatic | manual | manual | last-write-wins |
+| Single binary, no server | yes | no | yes | yes | yes |
 
 ## Install
 
@@ -12,71 +42,101 @@ SSH.
 go install github.com/varung/shasync@latest
 ```
 
-Or build from a checkout:
+Or build from source:
 
 ```bash
 git clone git@github.com:varung/shasync.git
-cd shasync
-go install .
+cd shasync && go install .
 ```
 
 ## Quickstart
 
 ```bash
-mkdir my-project && cd my-project
-shasync init
-echo "hello" > notes.txt
-shasync commit -m "first snapshot"
-shasync log
-```
-
-## Documentation
-
-For the full system design — local/remote layout, data flows, encryption
-wire format, threat model, and browser-client plans — see
-[ARCHITECTURE.md](ARCHITECTURE.md).
-
-All docs are also accessible from the binary itself:
-
-```bash
-shasync --help                  # command reference
-shasync help getting-started    # quickstart walkthrough
-shasync help workflow           # multi-machine sync (pull → commit → push, auto-merge)
-shasync help architecture       # full system overview: layout, commands, data flow
-shasync help encryption         # client-side encryption + passphrase setup
-shasync help s3                 # using an S3 remote (incl. credentials)
-shasync help gcs                # using a GCS remote (incl. credentials)
-shasync help ssh                # syncing two machines over SSH with rsync
-shasync help ignore             # the .blobsignore file
-```
-
-## Multi-machine sync
-
-shasync is designed for one user editing the same folder from several
-machines. The pattern:
-
-```bash
-# machine B, fresh clone
+# Machine A: create a project
 mkdir my-project && cd my-project
 shasync init
 shasync remote set s3://my-bucket/my-project
-shasync pull                          # reads remote HEAD; materializes files
 
-# everyday use on either machine
-shasync pull                          # sync from remote
-(edit files)
-shasync commit -m "..."               # refuses if remote moved while you were away
-shasync push                          # updates remote HEAD
+# Add files and push
+echo "hello" > notes.txt
+shasync push                    # auto-commits dirty files, uploads to S3
+
+# Machine B: clone it
+mkdir my-project && cd my-project
+shasync init
+shasync remote set s3://my-bucket/my-project
+shasync pull                    # downloads and materializes files
 ```
 
-`commit` contacts the remote to check that you aren't behind; pass
-`--offline` to skip the check when you know you're offline. If two
-machines *do* commit from the same base without pulling, `push` on the
-second machine auto-merges against the remote tip — non-conflicting
-changes are applied, and files edited differently on both sides keep
-the remote version at the original path plus a Dropbox-style
-`<name> (conflict from <host> <date>).<ext>` copy for your local
-version. See `shasync help workflow` for the full story.
+## Watch mode (auto-sync)
+
+The killer feature. Run `shasync watch` and forget about it — changes
+are committed and synced automatically:
+
+```bash
+shasync watch                   # default: 2s debounce, 30s remote poll
+shasync watch --debounce 5s --poll 1m
+```
+
+Every time a file changes:
+1. Wait for the debounce quiet period
+2. Commit the working tree
+3. Pull from remote (auto-merge if another machine pushed)
+4. Push to remote
+
+It also polls the remote on an interval to pick up changes from other
+machines, even when no local files changed.
+
+## Multi-machine sync
+
+The manual workflow (if you prefer explicit control):
+
+```bash
+shasync pull        # fetch + merge + checkout
+(edit files)
+shasync push        # auto-commit + upload
+```
+
+If two machines push independently, the second machine's `push` will
+fail with "remote has moved." Run `pull` — it auto-merges:
+
+- Files changed on only one side: taken as-is
+- Files changed on both sides to the same content: no conflict
+- Files changed on both sides differently: remote version kept at
+  original path, local version saved as
+  `<name> (modified on <date> by <client-id>).<ext>`
+
+No manual conflict resolution. No blocked pushes. No lost work.
+
+## Encryption
+
+```bash
+shasync key set-passphrase      # Argon2id derivation; same passphrase on each machine
+# or
+shasync key gen                 # random key; copy .blobs/key to other machines
+```
+
+When a key is configured, all blobs and manifests are AES-256-GCM
+encrypted before upload and verified on download. The key never touches
+the remote. Wire format is chunked (64 KiB) to support range reads.
+
+## Compression
+
+All uploads are zstd-compressed before encryption. Downloads auto-detect
+the format via magic bytes, so old uncompressed blobs from before this
+feature was added are read transparently. zstd's incompressible-data
+fast path means there's no meaningful penalty for binary files.
+
+## Copy-on-write
+
+On APFS (macOS) and Btrfs/XFS (Linux), shasync uses filesystem reflinks
+so the working tree and the object store share physical disk extents. A
+2GB file appears in both your working directory and `.blobs/objects/` but
+occupies disk space only once. This is why shasync doesn't need a
+separate "large file" mode — the same code path handles a 1KB config
+file and a 10GB dataset equally well.
+
+Verify it works on your filesystem: `shasync test-cow`
 
 ## How it works
 
@@ -84,56 +144,46 @@ version. See `shasync help workflow` for the full story.
 
 ```
 <repo>/
-  <your files ...>
-  .blobsignore                       # optional, gitignore-style patterns
+  <your files>
+  .blobsignore                       # optional, gitignore-style
   .blobs/
     HEAD                             # current manifest SHA
-    config.json                      # { "remote": "s3://bucket/prefix" }
-    key                              # hex AES-256 key (chmod 600; gitignored)
-    objects/<sha[:2]>/<sha[2:]>      # one file per blob, immutable
+    config.json                      # { "remote": "s3://..." }
+    key                              # hex AES-256 key (optional)
+    objects/<sha[:2]>/<sha[2:]>      # immutable content-addressed blobs
     manifests/<sha[:2]>/<sha[2:]>.json
 ```
-
-Files are ingested with a copy-on-write reflink when the filesystem
-supports it (APFS on macOS, Btrfs/XFS on Linux), so commit and checkout
-consume almost no extra disk space.
 
 ### Remote layout
 
 ```
 <bucket>/<prefix>/
-  salt                # 16 random bytes; present only if a passphrase is in use
-  blobs/<sha>         # one object per blob (encrypted if a key is configured)
-  manifests/<sha>     # one object per manifest (same)
+  HEAD              # mutable pointer to current tip manifest
+  salt              # Argon2id salt (only if passphrase in use)
+  blobs/<sha>       # one object per blob (compressed, optionally encrypted)
+  manifests/<sha>   # one object per manifest (same)
 ```
 
-The remote object key is always the SHA-256 of the plaintext, so two
-clients uploading the same file dedup automatically. One bucket can host
-many shasync projects — each lives under its own `<prefix>`.
+Remote keys are the SHA-256 of the plaintext, so identical files dedup
+across clients and commits automatically.
 
-### Encryption (optional)
+## Documentation
 
-If a key is configured (`shasync key gen` or `shasync key set-passphrase`),
-all blobs and manifests are AES-256-GCM encrypted before upload and
-decrypted + SHA-verified on download. The key is never sent to the
-remote. Wire format is chunked (64 KiB plaintext chunks), so a
-range-aware reader can fetch just the chunks covering a plaintext byte
-range without downloading the whole blob — useful for large-file
-scenarios and browser clients.
+All docs are built into the binary:
 
-Two ways to configure a key:
+```bash
+shasync help getting-started    # quickstart
+shasync help workflow           # multi-machine sync + auto-merge
+shasync help watch              # watch mode
+shasync help compression        # zstd compression details
+shasync help encryption         # E2E encryption + passphrase setup
+shasync help architecture       # full system design
+shasync help s3                 # S3 remote setup
+shasync help gcs                # GCS remote setup
+shasync help ignore             # .blobsignore patterns
+```
 
-- **Random key** — `shasync key gen` writes 32 random bytes to
-  `.blobs/key`. Copy that file out-of-band to every other machine.
-- **Passphrase** — `shasync key set-passphrase` prompts for a passphrase,
-  derives a key via Argon2id (salt stored in the bucket at
-  `<prefix>/salt`, never secret), and caches the derived key at
-  `.blobs/key`. Run the same command with the same passphrase on each
-  machine — no file transfer required.
-
-Threat model is accidental bucket exposure: protects against a misconfigured
-public-read bucket, not against an attacker who has compromised the key.
-See `shasync help encryption` for details.
+Or see [ARCHITECTURE.md](ARCHITECTURE.md) for the full system design.
 
 ## License
 
