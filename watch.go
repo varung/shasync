@@ -214,9 +214,9 @@ func syncAndLog(ctx context.Context, s *Store, r Remote, cryptKey []byte, c *Con
 		return
 	}
 	if before == after {
-		fmt.Printf("%s  up to date (%s)\n", stamp, shortSHA(after))
+		fmt.Printf("\r\033[K%s  up to date (%s)", stamp, shortSHA(after))
 	} else {
-		fmt.Printf("%s  synced %s → %s\n", stamp, shortSHA(before), shortSHA(after))
+		fmt.Printf("\r\033[K%s  synced %s → %s\n", stamp, shortSHA(before), shortSHA(after))
 	}
 }
 
