@@ -56,6 +56,7 @@ func splitBucketPrefix(s string) (string, string) {
 
 func remoteBlobKey(sha string) string     { return "blobs/" + sha }
 func remoteManifestKey(sha string) string { return "manifests/" + sha }
+func pushLogPrefix() string               { return "push-log/" }
 
 // remoteHeadKey is the shared mutable pointer at <prefix>/HEAD. It contains a
 // single 64-hex-char SHA (the current tip manifest) plus a newline.

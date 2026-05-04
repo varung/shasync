@@ -1118,10 +1118,161 @@ func cmdPush(ctx context.Context, args []string) error {
 	return fmt.Errorf("remote has moved (remote=%s, local=%s) — run: shasync pull", shortSHA(remote), shortSHA(pushSha))
 }
 
-// uploadManifestChainAndSetHead uploads every blob referenced by sha's chain
-// that the remote doesn't already have, then uploads the manifest chain (tip
-// last so a remote observer never sees a dangling parent pointer), then
-// atomically updates <prefix>/HEAD.
+// --- push-log cache ----------------------------------------------------------
+//
+// The push-log avoids per-object Exists calls during push. Each push writes a
+// small sidecar file to push-log/<timestamp>-<manifest-sha> on the remote,
+// listing the SHAs of objects (blobs + manifests) that were newly uploaded in
+// that push. On the next push we list push-log/, download any entries newer
+// than our local cursor, and build a set of known-remote SHAs. Objects in that
+// set are skipped without a network round-trip.
+//
+// Local cache: .blobs/push-log-cache — first line is the cursor (last push-log
+// key fully processed), remaining lines are one SHA per line.
+
+type pushLogCache struct {
+	Cursor string
+	Known  map[string]struct{}
+}
+
+func (s *Store) readPushLogCache() *pushLogCache {
+	c := &pushLogCache{Known: make(map[string]struct{})}
+	b, err := os.ReadFile(s.pushLogCachePath())
+	if err != nil {
+		return c
+	}
+	lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+	if len(lines) == 0 {
+		return c
+	}
+	c.Cursor = lines[0]
+	for _, l := range lines[1:] {
+		if l != "" {
+			c.Known[l] = struct{}{}
+		}
+	}
+	return c
+}
+
+func (s *Store) writePushLogCache(c *pushLogCache) error {
+	var buf strings.Builder
+	buf.WriteString(c.Cursor)
+	buf.WriteByte('\n')
+	shas := make([]string, 0, len(c.Known))
+	for sha := range c.Known {
+		shas = append(shas, sha)
+	}
+	sort.Strings(shas)
+	for _, sha := range shas {
+		buf.WriteString(sha)
+		buf.WriteByte('\n')
+	}
+	return writeFileAtomic(s.pushLogCachePath(), []byte(buf.String()), 0o644)
+}
+
+// seedKnownFromListing is the fallback for legacy remotes that have no
+// push-log entries yet. It lists blobs/ and manifests/ to build the known
+// set, so the first push after upgrade doesn't re-upload everything.
+func seedKnownFromListing(ctx context.Context, r Remote) (map[string]struct{}, string, error) {
+	known := make(map[string]struct{})
+	blobKeys, err := r.List(ctx, "blobs/")
+	if err != nil {
+		return nil, "", fmt.Errorf("list blobs: %w", err)
+	}
+	for _, k := range blobKeys {
+		sha := strings.TrimPrefix(k, "blobs/")
+		known[sha] = struct{}{}
+	}
+	manKeys, err := r.List(ctx, "manifests/")
+	if err != nil {
+		return nil, "", fmt.Errorf("list manifests: %w", err)
+	}
+	for _, k := range manKeys {
+		sha := strings.TrimPrefix(k, "manifests/")
+		known[sha] = struct{}{}
+	}
+	return known, "", nil
+}
+
+// pushLogKey returns a remote key for a push-log entry. Zero-padded ms
+// timestamp ensures lexicographic order matches chronological order.
+func pushLogKey(tsMs int64, manifestSHA string) string {
+	return fmt.Sprintf("%s%020d-%s", pushLogPrefix(), tsMs, manifestSHA)
+}
+
+// fetchKnownRemoteSHAs lists push-log/ entries on the remote, downloads any
+// newer than the cached cursor, and returns the merged set of all known SHAs
+// plus the new cursor. The set covers both blob and manifest SHAs.
+func fetchKnownRemoteSHAs(ctx context.Context, r Remote, s *Store, cache *pushLogCache) (map[string]struct{}, string, error) {
+	entries, err := r.List(ctx, pushLogPrefix())
+	if err != nil {
+		return nil, "", fmt.Errorf("list push-log: %w", err)
+	}
+
+	// Legacy / first-time: no push-log entries and no local cache. Fall back
+	// to listing blobs/ and manifests/ so we don't re-upload everything.
+	if len(entries) == 0 && cache.Cursor == "" && len(cache.Known) == 0 {
+		return seedKnownFromListing(ctx, r)
+	}
+
+	// Filter to entries after cursor (lexicographic comparison works because
+	// keys are zero-padded timestamps).
+	var toFetch []string
+	for _, e := range entries {
+		if cache.Cursor == "" || e > cache.Cursor {
+			toFetch = append(toFetch, e)
+		}
+	}
+	sort.Strings(toFetch)
+	// Download new entries in parallel and merge into known set.
+	type result struct {
+		key  string
+		shas []string
+	}
+	results := make([]result, len(toFetch))
+	if err := parallelFor(ctx, 16, toFetch, func(ctx context.Context, key string) error {
+		rc, dlErr := r.Download(ctx, key)
+		if dlErr != nil {
+			return dlErr
+		}
+		defer rc.Close()
+		data, readErr := io.ReadAll(rc)
+		if readErr != nil {
+			return readErr
+		}
+		var shas []string
+		for _, l := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
+			if l != "" {
+				shas = append(shas, l)
+			}
+		}
+		// Find the index for this key to store result.
+		for i, k := range toFetch {
+			if k == key {
+				results[i] = result{key: key, shas: shas}
+				break
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, "", err
+	}
+	known := cache.Known
+	for _, res := range results {
+		for _, sha := range res.shas {
+			known[sha] = struct{}{}
+		}
+	}
+	newCursor := cache.Cursor
+	if len(toFetch) > 0 {
+		newCursor = toFetch[len(toFetch)-1]
+	}
+	return known, newCursor, nil
+}
+
+// uploadManifestChainAndSetHead uploads every blob and manifest referenced by
+// sha's chain that the remote doesn't already have (determined via push-log,
+// not per-object Exists calls), then atomically updates <prefix>/HEAD.
 func uploadManifestChainAndSetHead(ctx context.Context, r Remote, s *Store, cryptKey []byte, sha string) error {
 	m, err := s.readManifest(sha)
 	if err != nil {
@@ -1153,27 +1304,71 @@ func uploadManifestChainAndSetHead(ctx context.Context, r Remote, s *Store, cryp
 		}
 		collect(pm)
 	}
-	blobList := make([]string, 0, len(seenBlobs))
-	for b := range seenBlobs {
-		blobList = append(blobList, b)
+
+	// Build the set of SHAs known to exist on the remote via push-log.
+	cache := s.readPushLogCache()
+	known, newCursor, err := fetchKnownRemoteSHAs(ctx, r, s, cache)
+	if err != nil {
+		return err
 	}
-	sort.Strings(blobList)
-	if err := parallelFor(ctx, 16, blobList, func(ctx context.Context, b string) error {
-		return uploadLocalFile(ctx, r, cryptKey, s.objectPath(b), remoteBlobKey(b))
+
+	// Filter blobs: only upload those not already on the remote.
+	var novelBlobs []string
+	for b := range seenBlobs {
+		if _, ok := known[b]; !ok {
+			novelBlobs = append(novelBlobs, b)
+		}
+	}
+	sort.Strings(novelBlobs)
+	if err := parallelFor(ctx, 16, novelBlobs, func(ctx context.Context, b string) error {
+		return uploadFile(ctx, r, cryptKey, s.objectPath(b), remoteBlobKey(b))
 	}); err != nil {
 		return err
 	}
-	// Tip last.
+
+	// Filter manifests: only upload those not already on the remote.
+	var novelManifests []string
 	for i := len(manifestsToPush) - 1; i >= 0; i-- {
 		mSha := manifestsToPush[i]
-		if err := uploadLocalFile(ctx, r, cryptKey, s.manifestPath(mSha), remoteManifestKey(mSha)); err != nil {
+		if _, ok := known[mSha]; !ok {
+			novelManifests = append(novelManifests, mSha)
+		}
+	}
+	// Upload oldest-first so a remote observer never sees a dangling parent.
+	for _, mSha := range novelManifests {
+		if err := uploadFile(ctx, r, cryptKey, s.manifestPath(mSha), remoteManifestKey(mSha)); err != nil {
 			return err
 		}
 	}
+
 	if err := writeRemoteHead(ctx, r, sha); err != nil {
 		return fmt.Errorf("set remote HEAD: %w", err)
 	}
-	fmt.Printf("pushed %s  (%d blobs, %d manifests; remote HEAD updated)\n", sha, len(blobList), len(manifestsToPush))
+
+	// Write push-log entry listing novel SHAs uploaded in this push.
+	allNovel := make([]string, 0, len(novelBlobs)+len(novelManifests))
+	allNovel = append(allNovel, novelBlobs...)
+	allNovel = append(allNovel, novelManifests...)
+	if len(allNovel) > 0 {
+		entry := strings.Join(allNovel, "\n") + "\n"
+		plKey := pushLogKey(nowUnixMs(), sha)
+		if err := r.Upload(ctx, plKey, strings.NewReader(entry)); err != nil {
+			return fmt.Errorf("write push-log: %w", err)
+		}
+		// Update local cache.
+		for _, sha := range allNovel {
+			known[sha] = struct{}{}
+		}
+		cache.Cursor = plKey
+		cache.Known = known
+		_ = s.writePushLogCache(cache)
+	} else if newCursor != cache.Cursor {
+		cache.Cursor = newCursor
+		cache.Known = known
+		_ = s.writePushLogCache(cache)
+	}
+
+	fmt.Printf("pushed %s  (%d new blobs, %d new manifests; remote HEAD updated)\n", sha, len(novelBlobs), len(novelManifests))
 	return nil
 }
 
@@ -1440,16 +1635,10 @@ func downloadBlob(ctx context.Context, r Remote, s *Store, cryptKey []byte, sha 
 	return downloadAndStore(ctx, r, cryptKey, remoteBlobKey(sha), s.objectPath(sha), sha)
 }
 
-// uploadLocalFile zstd-compresses localPath, optionally encrypts (if cryptKey
-// != nil), and uploads under remoteKey. Skips if the key already exists.
-func uploadLocalFile(ctx context.Context, r Remote, cryptKey []byte, localPath, remoteKey string) error {
-	ok, err := r.Exists(ctx, remoteKey)
-	if err != nil {
-		return err
-	}
-	if ok {
-		return nil
-	}
+// uploadFile zstd-compresses localPath, optionally encrypts (if cryptKey
+// != nil), and uploads under remoteKey. Caller is responsible for dedup
+// (the push-log cache handles this at a higher level).
+func uploadFile(ctx context.Context, r Remote, cryptKey []byte, localPath, remoteKey string) error {
 	f, err := os.Open(localPath)
 	if err != nil {
 		return err

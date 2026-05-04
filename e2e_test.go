@@ -249,6 +249,9 @@ func TestEncryptedPushPullViaS3Emulator(t *testing.T) {
 		if o.Key == "encrypted-project/salt" {
 			continue // salt is stored plaintext by design
 		}
+		if strings.HasPrefix(o.Key, "encrypted-project/push-log/") {
+			continue // push-log contains only SHAs which are already public as object keys
+		}
 		if o.Key == "encrypted-project/HEAD" {
 			// HEAD is plaintext by design (a 64-hex SHA that's already the
 			// public name of a manifest object — adds no information over
