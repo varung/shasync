@@ -31,6 +31,7 @@ COMMANDS
                                 uses delta for highlighting if installed)
   info                          summary: repo, HEAD, remote, encryption, counts
   head                          print the HEAD manifest SHA
+  ls [<prefix>]                list objects in the remote bucket
   remote set <url>              configure remote (gs://... or s3://...)
   remote show                   print the configured remote
   push [<sha>] [--force]        upload + update remote HEAD; auto-merges forks
@@ -41,6 +42,7 @@ COMMANDS
                                 poll: remote check interval (default 30s)
   key gen                       generate a random 32-byte repo encryption key
   key set-passphrase            derive a key from a passphrase via Argon2id
+  key verify                    check you still remember your passphrase
   key show                      print the configured encryption key (or "none")
   test-cow                      verify copy-on-write (reflink) works
   help <topic>                  show detailed help on a topic

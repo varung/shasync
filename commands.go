@@ -900,6 +900,38 @@ func cmdTestCOW() error {
 
 // --- remote ---
 
+func cmdLs(ctx context.Context, args []string) error {
+	s, err := findStore()
+	if err != nil {
+		return err
+	}
+	c, err := s.readConfig()
+	if err != nil {
+		return err
+	}
+	if c.Remote == "" {
+		return fmt.Errorf("no remote set — run: shasync remote set <url>")
+	}
+	r, err := newRemote(ctx, c.Remote)
+	if err != nil {
+		return err
+	}
+
+	prefix := ""
+	if len(args) > 0 {
+		prefix = args[0]
+	}
+
+	keys, err := r.List(ctx, prefix)
+	if err != nil {
+		return err
+	}
+	for _, k := range keys {
+		fmt.Println(k)
+	}
+	return nil
+}
+
 func cmdRemote(args []string) error {
 	s, err := findStore()
 	if err != nil {
@@ -939,7 +971,7 @@ func cmdRemote(args []string) error {
 
 func cmdKey(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: shasync key {gen|set-passphrase|show}")
+		return fmt.Errorf("usage: shasync key {gen|set-passphrase|verify|show}")
 	}
 	s, err := findStore()
 	if err != nil {
@@ -1006,6 +1038,42 @@ func cmdKey(ctx context.Context, args []string) error {
 		}
 		fmt.Printf("wrote %s (chmod 600)\n", s.keyPath())
 		return nil
+	case "verify":
+		k, err := s.loadKey()
+		if err != nil {
+			return err
+		}
+		if k == nil {
+			return fmt.Errorf("no key configured — nothing to verify")
+		}
+		c, err := s.readConfig()
+		if err != nil {
+			return err
+		}
+		if c.Remote == "" {
+			return fmt.Errorf("no remote set — cannot fetch salt")
+		}
+		r, err := newRemote(ctx, c.Remote)
+		if err != nil {
+			return err
+		}
+		salt, _, err := fetchOrCreateSalt(ctx, r)
+		if err != nil {
+			return err
+		}
+		pass, err := readPassphrase("passphrase: ")
+		if err != nil {
+			return err
+		}
+		derived := deriveKeyFromPassphrase(pass, salt)
+		if !bytes.Equal(derived, k) {
+			return fmt.Errorf("passphrase does not match the stored key")
+		}
+		if err := os.WriteFile(s.keyVerifiedPath(), []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o644); err != nil {
+			return err
+		}
+		fmt.Println("passphrase correct ✓")
+		return nil
 	case "show":
 		k, err := s.loadKey()
 		if err != nil {
@@ -1019,6 +1087,29 @@ func cmdKey(ctx context.Context, args []string) error {
 		return nil
 	default:
 		return fmt.Errorf("unknown: shasync key %s", args[0])
+	}
+}
+
+// --- passphrase nudge --------------------------------------------------------
+
+const passphraseNudgeDays = 30
+
+func passphraseNudge(s *Store) {
+	if _, err := os.Stat(s.keyPath()); err != nil {
+		return
+	}
+	b, err := os.ReadFile(s.keyVerifiedPath())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "reminder: you have never verified your passphrase — run: shasync key verify\n")
+		return
+	}
+	t, err := time.Parse(time.RFC3339, strings.TrimSpace(string(b)))
+	if err != nil {
+		return
+	}
+	if time.Since(t) > time.Duration(passphraseNudgeDays)*24*time.Hour {
+		fmt.Fprintf(os.Stderr, "reminder: it's been %d days since you verified your passphrase — run: shasync key verify\n",
+			int(time.Since(t).Hours()/24))
 	}
 }
 
@@ -1060,6 +1151,7 @@ func cmdPush(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	passphraseNudge(s)
 	r, err := newRemote(ctx, c.Remote)
 	if err != nil {
 		return err
@@ -1496,6 +1588,7 @@ func cmdPull(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	passphraseNudge(s)
 	r, err := newRemote(ctx, c.Remote)
 	if err != nil {
 		return err

@@ -63,6 +63,9 @@ func (s *Store) manifestPath(sha string) string {
 func (s *Store) pushLogCachePath() string {
 	return filepath.Join(s.blobsPath(), "push-log-cache")
 }
+func (s *Store) keyVerifiedPath() string {
+	return filepath.Join(s.blobsPath(), "key-verified-at")
+}
 
 func initStore(root string) error {
 	bp := filepath.Join(root, blobsDir)
