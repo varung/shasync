@@ -1049,3 +1049,174 @@ func TestClientIDStableAcrossRuns(t *testing.T) {
 		t.Fatalf("two fresh inits produced the same client_id %q — want distinct", id1)
 	}
 }
+
+// --- GC: delete local blobs already on the remote ---
+
+func TestGCDeletesOldBlobsKeepsHEAD(t *testing.T) {
+	backend := s3mem.New()
+	faker := gofakes3.New(backend)
+	srv := httptest.NewServer(faker.Server())
+	t.Cleanup(srv.Close)
+	if err := backend.CreateBucket("shasync-test"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SHASYNC_S3_ENDPOINT", srv.URL)
+	t.Setenv("SHASYNC_S3_FORCE_PATH_STYLE", "1")
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	t.Setenv("AWS_REGION", "us-east-1")
+
+	ctx := context.Background()
+	remoteURL := "s3://shasync-test/gc-test"
+
+	dir := makeWorkTree(t)
+	chdir(t, dir)
+	must(t, cmdInit())
+	must(t, cmdRemote([]string{"set", remoteURL}))
+
+	// Commit 1: initial files.
+	must(t, cmdCommit(ctx, []string{"-m", "first"}))
+	must(t, cmdPush(ctx, nil))
+
+	s, _ := findStore()
+	head1, _ := s.readHead()
+	m1, _ := s.readManifest(head1)
+
+	// Commit 2: modify a file so commit 1 has a blob not in commit 2.
+	write(t, filepath.Join(dir, "hello.txt"), "changed content\n")
+	must(t, cmdCommit(ctx, []string{"-m", "second"}))
+	must(t, cmdPush(ctx, nil))
+
+	head2, _ := s.readHead()
+	m2, _ := s.readManifest(head2)
+	if head1 == head2 {
+		t.Fatal("expected different HEADs")
+	}
+
+	// Identify a blob only in commit 1 (old hello.txt).
+	oldHelloSHA := m1.Files["hello.txt"].SHA
+	newHelloSHA := m2.Files["hello.txt"].SHA
+	if oldHelloSHA == newHelloSHA {
+		t.Fatal("expected different SHAs for hello.txt across commits")
+	}
+	if !s.hasObject(oldHelloSHA) {
+		t.Fatal("old blob should exist locally before gc")
+	}
+
+	// Run gc.
+	must(t, cmdGC(ctx, nil))
+
+	// Old blob should be gone.
+	if s.hasObject(oldHelloSHA) {
+		t.Fatal("gc should have deleted old blob not in HEAD")
+	}
+
+	// HEAD blobs must still be present.
+	for path, f := range m2.Files {
+		if !s.hasObject(f.SHA) {
+			t.Fatalf("gc deleted HEAD blob for %s", path)
+		}
+	}
+}
+
+func TestGCRefusesToDeleteBlobsNotOnRemote(t *testing.T) {
+	backend := s3mem.New()
+	faker := gofakes3.New(backend)
+	srv := httptest.NewServer(faker.Server())
+	t.Cleanup(srv.Close)
+	if err := backend.CreateBucket("shasync-test"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SHASYNC_S3_ENDPOINT", srv.URL)
+	t.Setenv("SHASYNC_S3_FORCE_PATH_STYLE", "1")
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	t.Setenv("AWS_REGION", "us-east-1")
+
+	ctx := context.Background()
+	remoteURL := "s3://shasync-test/gc-safe-test"
+
+	dir := makeWorkTree(t)
+	chdir(t, dir)
+	must(t, cmdInit())
+	must(t, cmdRemote([]string{"set", remoteURL}))
+
+	// Commit 1: push so remote knows about these blobs.
+	must(t, cmdCommit(ctx, []string{"-m", "first"}))
+	must(t, cmdPush(ctx, nil))
+
+	// Commit 2: new content, but do NOT push.
+	write(t, filepath.Join(dir, "hello.txt"), "unpushed content\n")
+	must(t, cmdCommit(ctx, []string{"-m", "unpushed"}))
+
+	s, _ := findStore()
+	head, _ := s.readHead()
+	m, _ := s.readManifest(head)
+
+	// Commit 3: change hello.txt again so commit 2's blob is not in HEAD.
+	write(t, filepath.Join(dir, "hello.txt"), "third version\n")
+	must(t, cmdCommit(ctx, []string{"-m", "third"}))
+
+	unpushedSHA := m.Files["hello.txt"].SHA
+	if !s.hasObject(unpushedSHA) {
+		t.Fatal("unpushed blob should exist before gc")
+	}
+
+	// GC should NOT delete the unpushed blob — it's not confirmed on the remote.
+	must(t, cmdGC(ctx, nil))
+
+	if !s.hasObject(unpushedSHA) {
+		t.Fatal("gc deleted a blob not confirmed on remote — data loss!")
+	}
+}
+
+func TestGCThenCheckoutOldCommitViaPull(t *testing.T) {
+	backend := s3mem.New()
+	faker := gofakes3.New(backend)
+	srv := httptest.NewServer(faker.Server())
+	t.Cleanup(srv.Close)
+	if err := backend.CreateBucket("shasync-test"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SHASYNC_S3_ENDPOINT", srv.URL)
+	t.Setenv("SHASYNC_S3_FORCE_PATH_STYLE", "1")
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	t.Setenv("AWS_REGION", "us-east-1")
+
+	ctx := context.Background()
+	remoteURL := "s3://shasync-test/gc-pull-test"
+
+	dir := makeWorkTree(t)
+	chdir(t, dir)
+	must(t, cmdInit())
+	must(t, cmdRemote([]string{"set", remoteURL}))
+
+	// Commit 1.
+	must(t, cmdCommit(ctx, []string{"-m", "first"}))
+	must(t, cmdPush(ctx, nil))
+	s, _ := findStore()
+	head1, _ := s.readHead()
+
+	// Commit 2.
+	write(t, filepath.Join(dir, "hello.txt"), "v2\n")
+	must(t, cmdCommit(ctx, []string{"-m", "second"}))
+	must(t, cmdPush(ctx, nil))
+
+	// GC removes commit 1's blobs locally.
+	must(t, cmdGC(ctx, nil))
+
+	// Checkout of head1 should fail (blobs missing).
+	err := cmdCheckout([]string{head1})
+	if err == nil {
+		t.Fatal("expected checkout to fail after gc — blobs are missing")
+	}
+
+	// Pull head1 to re-fetch blobs, then checkout.
+	must(t, cmdPull(ctx, []string{head1}))
+	must(t, cmdCheckout([]string{head1}))
+
+	if got := read(t, filepath.Join(dir, "hello.txt")); got != "hello world\n" {
+		t.Fatalf("expected original content after pull+checkout, got %q", got)
+	}
+}

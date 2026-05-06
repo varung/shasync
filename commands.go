@@ -1090,6 +1090,118 @@ func cmdKey(ctx context.Context, args []string) error {
 	}
 }
 
+// --- gc ----------------------------------------------------------------------
+
+func cmdGC(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("gc", flag.ExitOnError)
+	dryRun := fs.Bool("dry-run", false, "print what would be deleted without deleting")
+	_ = fs.Parse(args)
+
+	s, err := findStore()
+	if err != nil {
+		return err
+	}
+	c, err := s.readConfig()
+	if err != nil {
+		return err
+	}
+	if c.Remote == "" {
+		return fmt.Errorf("no remote set — gc needs a remote to verify blobs exist before deleting locally")
+	}
+	r, err := newRemote(ctx, c.Remote)
+	if err != nil {
+		return err
+	}
+
+	head, err := s.readHead()
+	if err != nil {
+		return err
+	}
+	if head == "" {
+		return fmt.Errorf("no HEAD — nothing to gc")
+	}
+
+	// Collect blobs referenced by HEAD — these are never deleted.
+	headManifest, err := s.readManifest(head)
+	if err != nil {
+		return err
+	}
+	keep := make(map[string]struct{}, len(headManifest.Files))
+	for _, f := range headManifest.Files {
+		keep[f.SHA] = struct{}{}
+	}
+
+	// List all local objects.
+	allLocal, err := s.listLocalObjects()
+	if err != nil {
+		return err
+	}
+
+	// Candidates: local objects not referenced by HEAD.
+	var candidates []string
+	for _, sha := range allLocal {
+		if _, ok := keep[sha]; !ok {
+			candidates = append(candidates, sha)
+		}
+	}
+	if len(candidates) == 0 {
+		fmt.Println("nothing to gc — all local blobs are referenced by HEAD")
+		return nil
+	}
+
+	// Build remote-known set from push-log cache.
+	cache := s.readPushLogCache()
+	known, _, err := fetchKnownRemoteSHAs(ctx, r, s, cache)
+	if err != nil {
+		return err
+	}
+
+	// Only delete blobs confirmed to be on the remote.
+	var toDelete []string
+	var skipped int
+	for _, sha := range candidates {
+		if _, ok := known[sha]; ok {
+			toDelete = append(toDelete, sha)
+		} else {
+			skipped++
+		}
+	}
+
+	if len(toDelete) == 0 {
+		fmt.Printf("nothing to gc — %d candidate(s) not confirmed on remote\n", skipped)
+		return nil
+	}
+
+	var totalBytes int64
+	for _, sha := range toDelete {
+		if info, err := os.Stat(s.objectPath(sha)); err == nil {
+			totalBytes += info.Size()
+		}
+	}
+
+	if *dryRun {
+		fmt.Printf("would delete %d blob(s), freeing ~%s  (skipping %d not confirmed on remote)\n",
+			len(toDelete), humanBytes(totalBytes), skipped)
+		return nil
+	}
+
+	var deleted int
+	for _, sha := range toDelete {
+		p := s.objectPath(sha)
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		deleted++
+	}
+
+	// Clean up empty shard directories.
+	s.pruneEmptyShardDirs()
+
+	fmt.Printf("deleted %d blob(s), freed ~%s  (skipped %d not confirmed on remote)\n",
+		deleted, humanBytes(totalBytes), skipped)
+	return nil
+}
+
 // --- passphrase nudge --------------------------------------------------------
 
 const passphraseNudgeDays = 30

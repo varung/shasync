@@ -36,6 +36,8 @@ func main() {
 		err = cmdInfo()
 	case "head":
 		err = cmdHead()
+	case "gc":
+		err = cmdGC(ctx, os.Args[2:])
 	case "ls":
 		err = cmdLs(ctx, os.Args[2:])
 	case "remote":

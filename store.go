@@ -170,6 +170,46 @@ func (s *Store) hasObject(sha string) bool {
 	return err == nil
 }
 
+func (s *Store) listLocalObjects() ([]string, error) {
+	objDir := s.objectsPath()
+	shards, err := os.ReadDir(objDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var shas []string
+	for _, shard := range shards {
+		if !shard.IsDir() || len(shard.Name()) != 2 {
+			continue
+		}
+		entries, err := os.ReadDir(filepath.Join(objDir, shard.Name()))
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range entries {
+			if !e.IsDir() {
+				shas = append(shas, shard.Name()+e.Name())
+			}
+		}
+	}
+	return shas, nil
+}
+
+func (s *Store) pruneEmptyShardDirs() {
+	objDir := s.objectsPath()
+	shards, err := os.ReadDir(objDir)
+	if err != nil {
+		return
+	}
+	for _, shard := range shards {
+		if shard.IsDir() {
+			_ = os.Remove(filepath.Join(objDir, shard.Name()))
+		}
+	}
+}
+
 // ingestFile hashes src, moves/copies it into the object store at its SHA
 // (using reflink when possible so the working file and object share extents),
 // and returns the SHA. If the object already exists, the file is not duplicated.

@@ -31,6 +31,7 @@ COMMANDS
                                 uses delta for highlighting if installed)
   info                          summary: repo, HEAD, remote, encryption, counts
   head                          print the HEAD manifest SHA
+  gc [--dry-run]               delete local blobs already on the remote
   ls [<prefix>]                list objects in the remote bucket
   remote set <url>              configure remote (gs://... or s3://...)
   remote show                   print the configured remote
