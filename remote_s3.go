@@ -22,19 +22,24 @@ type s3Remote struct {
 	prefix string
 }
 
-func newS3Remote(ctx context.Context, bucket, prefix string) (Remote, error) {
-	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+func newS3Remote(ctx context.Context, bucket, prefix string, appCfg *Config) (Remote, error) {
+	var loadOpts []func(*awsconfig.LoadOptions) error
+	if p := appCfg.S3Profile; p != "" {
+		loadOpts = append(loadOpts, awsconfig.WithSharedConfigProfile(p))
+	}
+	cfg, err := awsconfig.LoadDefaultConfig(ctx, loadOpts...)
 	if err != nil {
 		return nil, err
 	}
 	var optFns []func(*s3.Options)
-	customEndpoint := os.Getenv("SHASYNC_S3_ENDPOINT")
+	customEndpoint := firstNonEmpty(appCfg.S3Endpoint, os.Getenv("SHASYNC_S3_ENDPOINT"))
 	if customEndpoint != "" {
 		optFns = append(optFns, func(o *s3.Options) {
 			o.BaseEndpoint = aws.String(customEndpoint)
 		})
 	}
-	if os.Getenv("SHASYNC_S3_FORCE_PATH_STYLE") == "1" {
+	usePathStyle := !appCfg.S3VirtualHostedStyle && os.Getenv("SHASYNC_S3_FORCE_PATH_STYLE") != "0"
+	if usePathStyle {
 		optFns = append(optFns, func(o *s3.Options) {
 			o.UsePathStyle = true
 		})
@@ -54,6 +59,15 @@ func newS3Remote(ctx context.Context, bucket, prefix string) (Remote, error) {
 	}
 	c := s3.NewFromConfig(cfg, optFns...)
 	return &s3Remote{client: c, bucket: bucket, prefix: strings.TrimSuffix(prefix, "/")}, nil
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func (s *s3Remote) key(k string) string {

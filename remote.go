@@ -31,7 +31,8 @@ type Remote interface {
 //   SHASYNC_S3_ENDPOINT      — custom S3 endpoint (e.g. http://localhost:9000)
 //   SHASYNC_S3_FORCE_PATH_STYLE=1
 //   STORAGE_EMULATOR_HOST  — standard GCS emulator env (e.g. http://localhost:8080)
-func newRemote(ctx context.Context, url string) (Remote, error) {
+func newRemote(ctx context.Context, c *Config) (Remote, error) {
+	url := c.Remote
 	switch {
 	case strings.HasPrefix(url, "gs://"):
 		rest := strings.TrimPrefix(url, "gs://")
@@ -40,7 +41,7 @@ func newRemote(ctx context.Context, url string) (Remote, error) {
 	case strings.HasPrefix(url, "s3://"):
 		rest := strings.TrimPrefix(url, "s3://")
 		bucket, prefix := splitBucketPrefix(rest)
-		return newS3Remote(ctx, bucket, prefix)
+		return newS3Remote(ctx, bucket, prefix, c)
 	default:
 		return nil, fmt.Errorf("unsupported remote url: %s (expected gs:// or s3://)", url)
 	}

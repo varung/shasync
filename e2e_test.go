@@ -155,7 +155,7 @@ func runRemoteRoundTrip(t *testing.T, remoteURL string) {
 	chdir(t, a)
 	must(t, cmdInit())
 	must(t, cmdCommit(context.Background(), []string{"-m", "A-first"}))
-	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdRemote(ctx, []string{"set", remoteURL}))
 	must(t, cmdPush(ctx, nil))
 
 	sA, _ := findStore()
@@ -168,7 +168,7 @@ func runRemoteRoundTrip(t *testing.T, remoteURL string) {
 	b := t.TempDir()
 	chdir(t, b)
 	must(t, cmdInit())
-	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdRemote(ctx, []string{"set", remoteURL}))
 	must(t, cmdPull(ctx, []string{head}))
 	must(t, cmdCheckout([]string{head}))
 
@@ -218,7 +218,7 @@ func TestEncryptedPushPullViaS3Emulator(t *testing.T) {
 	must(t, cmdInit())
 	must(t, cmdKey(ctx, []string{"gen"}))
 	must(t, cmdCommit(context.Background(), []string{"-m", "encrypted"}))
-	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdRemote(ctx, []string{"set", remoteURL}))
 	must(t, cmdPush(ctx, nil))
 
 	sA, _ := findStore()
@@ -278,7 +278,7 @@ func TestEncryptedPushPullViaS3Emulator(t *testing.T) {
 	if err := os.WriteFile(sB.keyPath(), keyA, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdRemote(ctx, []string{"set", remoteURL}))
 	must(t, cmdPull(ctx, []string{head}))
 	must(t, cmdCheckout([]string{head}))
 	if read(t, filepath.Join(b, "hello.txt")) != marker {
@@ -294,7 +294,7 @@ func TestEncryptedPushPullViaS3Emulator(t *testing.T) {
 	if err := os.WriteFile(sC.keyPath(), []byte(hex.EncodeToString(wrong)+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdRemote(ctx, []string{"set", remoteURL}))
 	if err := cmdPull(ctx, []string{head}); err == nil {
 		t.Fatal("expected pull with wrong key to fail")
 	}
@@ -324,7 +324,7 @@ func TestPassphraseRoundTripViaS3Emulator(t *testing.T) {
 	a := makeWorkTree(t)
 	chdir(t, a)
 	must(t, cmdInit())
-	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdRemote(ctx, []string{"set", remoteURL}))
 	must(t, cmdKey(ctx, []string{"set-passphrase"}))
 	must(t, cmdCommit(context.Background(), []string{"-m", "passphrase commit"}))
 	must(t, cmdPush(ctx, nil))
@@ -336,7 +336,7 @@ func TestPassphraseRoundTripViaS3Emulator(t *testing.T) {
 	b := t.TempDir()
 	chdir(t, b)
 	must(t, cmdInit())
-	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdRemote(ctx, []string{"set", remoteURL}))
 	must(t, cmdKey(ctx, []string{"set-passphrase"}))
 	must(t, cmdPull(ctx, []string{head}))
 	must(t, cmdCheckout([]string{head}))
@@ -351,7 +351,7 @@ func TestPassphraseRoundTripViaS3Emulator(t *testing.T) {
 	c := t.TempDir()
 	chdir(t, c)
 	must(t, cmdInit())
-	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdRemote(ctx, []string{"set", remoteURL}))
 	t.Setenv("SHASYNC_PASSPHRASE", "wrong passphrase")
 	must(t, cmdKey(ctx, []string{"set-passphrase"}))
 	if err := cmdPull(ctx, []string{head}); err == nil {
@@ -461,7 +461,7 @@ func TestPullNoArgsFetchesRemoteHead(t *testing.T) {
 	a := makeWorkTree(t)
 	chdir(t, a)
 	must(t, cmdInit())
-	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdRemote(ctx, []string{"set", remoteURL}))
 	must(t, cmdCommit(ctx, []string{"-m", "A-first"}))
 	must(t, cmdPush(ctx, nil))
 	sA, _ := findStore()
@@ -471,7 +471,7 @@ func TestPullNoArgsFetchesRemoteHead(t *testing.T) {
 	b := t.TempDir()
 	chdir(t, b)
 	must(t, cmdInit())
-	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdRemote(ctx, []string{"set", remoteURL}))
 	must(t, cmdPull(ctx, nil))
 	sB, _ := findStore()
 	headB, _ := sB.readHead()
@@ -498,7 +498,7 @@ func TestLogRemoteWalksChain(t *testing.T) {
 	a := makeWorkTree(t)
 	chdir(t, a)
 	must(t, cmdInit())
-	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdRemote(ctx, []string{"set", remoteURL}))
 	must(t, cmdCommit(ctx, []string{"-m", "c1"}))
 	must(t, cmdPush(ctx, nil))
 	write(t, filepath.Join(a, "hello.txt"), "v2\n")
@@ -512,7 +512,7 @@ func TestLogRemoteWalksChain(t *testing.T) {
 	b := t.TempDir()
 	chdir(t, b)
 	must(t, cmdInit())
-	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdRemote(ctx, []string{"set", remoteURL}))
 	if err := cmdLog(ctx, []string{"--remote", "--summary"}); err != nil {
 		t.Fatalf("log --remote: %v", err)
 	}
@@ -539,7 +539,7 @@ func TestDivergentPushRefusesPullMerges(t *testing.T) {
 	a := makeWorkTree(t)
 	chdir(t, a)
 	must(t, cmdInit())
-	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdRemote(ctx, []string{"set", remoteURL}))
 	must(t, cmdCommit(ctx, []string{"-m", "base"}))
 	must(t, cmdPush(ctx, nil))
 
@@ -547,7 +547,7 @@ func TestDivergentPushRefusesPullMerges(t *testing.T) {
 	b := t.TempDir()
 	chdir(t, b)
 	must(t, cmdInit())
-	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdRemote(ctx, []string{"set", remoteURL}))
 	must(t, cmdPull(ctx, nil))
 	sB, _ := findStore()
 	cfgB, _ := sB.readConfig()
@@ -613,7 +613,7 @@ func TestDivergentPushRefusesPullMerges(t *testing.T) {
 	c := t.TempDir()
 	chdir(t, c)
 	must(t, cmdInit())
-	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdRemote(ctx, []string{"set", remoteURL}))
 	must(t, cmdPull(ctx, nil))
 	if got := read(t, filepath.Join(c, "hello.txt")); got != "A-version\n" {
 		t.Fatalf("C sees hello.txt = %q, want A-version", got)
@@ -682,14 +682,14 @@ func TestFastForwardPush(t *testing.T) {
 	a := makeWorkTree(t)
 	chdir(t, a)
 	must(t, cmdInit())
-	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdRemote(ctx, []string{"set", remoteURL}))
 	must(t, cmdCommit(ctx, []string{"-m", "c1"}))
 	must(t, cmdPush(ctx, nil))
 
 	b := t.TempDir()
 	chdir(t, b)
 	must(t, cmdInit())
-	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdRemote(ctx, []string{"set", remoteURL}))
 	must(t, cmdPull(ctx, nil))
 
 	// B adds a new file on top of the same base; commit + push should FF.
@@ -717,7 +717,7 @@ func TestPushForceOverwritesRemote(t *testing.T) {
 	a := makeWorkTree(t)
 	chdir(t, a)
 	must(t, cmdInit())
-	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdRemote(ctx, []string{"set", remoteURL}))
 	must(t, cmdCommit(ctx, []string{"-m", "c1"}))
 	must(t, cmdPush(ctx, nil))
 	write(t, filepath.Join(a, "hello.txt"), "c2\n")
@@ -731,7 +731,7 @@ func TestPushForceOverwritesRemote(t *testing.T) {
 	b := t.TempDir()
 	chdir(t, b)
 	must(t, cmdInit())
-	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdRemote(ctx, []string{"set", remoteURL}))
 	// Seed B at c1 by pulling then reverting the remote by force from B.
 	// Actually: easier is to have B commit from scratch with no parent,
 	// yielding a chain with NO common ancestor with remote — still a
@@ -752,7 +752,7 @@ func TestPushForceOverwritesRemote(t *testing.T) {
 	// With --force, push overwrites remote HEAD regardless.
 	must(t, cmdPush(ctx, []string{"--force"}))
 
-	r, err := newRemote(ctx, remoteURL)
+	r, err := newRemote(ctx, &Config{Remote: remoteURL})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -776,7 +776,7 @@ func TestPullAndLogOnEmptyRemote(t *testing.T) {
 	dir := t.TempDir()
 	chdir(t, dir)
 	must(t, cmdInit())
-	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdRemote(ctx, []string{"set", remoteURL}))
 
 	// pull with no args: remote HEAD is absent → expected error.
 	if err := cmdPull(ctx, nil); err == nil {
@@ -802,7 +802,7 @@ func TestPushAutoCommitsDirtyTree(t *testing.T) {
 	a := makeWorkTree(t)
 	chdir(t, a)
 	must(t, cmdInit())
-	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdRemote(ctx, []string{"set", remoteURL}))
 
 	// No explicit commit — straight to push. The initial files from
 	// makeWorkTree are uncommitted; push must snapshot them.
@@ -814,7 +814,7 @@ func TestPushAutoCommitsDirtyTree(t *testing.T) {
 	}
 
 	// Confirm it materialized on the remote.
-	r, err := newRemote(ctx, remoteURL)
+	r, err := newRemote(ctx, &Config{Remote: remoteURL})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -877,7 +877,7 @@ func TestTwoFoldersImplicitCommitFlow(t *testing.T) {
 	a := makeWorkTree(t)
 	chdir(t, a)
 	must(t, cmdInit())
-	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdRemote(ctx, []string{"set", remoteURL}))
 	must(t, cmdPush(ctx, nil)) // implicit commit, then upload
 
 	sA, _ := findStore()
@@ -888,7 +888,7 @@ func TestTwoFoldersImplicitCommitFlow(t *testing.T) {
 	b := t.TempDir()
 	chdir(t, b)
 	must(t, cmdInit())
-	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdRemote(ctx, []string{"set", remoteURL}))
 	must(t, cmdPull(ctx, nil))
 
 	sB, _ := findStore()
@@ -1003,7 +1003,7 @@ func TestTwoFoldersImplicitCommitFlow(t *testing.T) {
 	c := t.TempDir()
 	chdir(t, c)
 	must(t, cmdInit())
-	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdRemote(ctx, []string{"set", remoteURL}))
 	must(t, cmdPull(ctx, nil))
 	if got := read(t, filepath.Join(c, "hello.txt")); got != "A offline edit\n" {
 		t.Fatalf("C hello.txt = %q, want A offline edit", got)
@@ -1072,7 +1072,7 @@ func TestGCDeletesOldBlobsKeepsHEAD(t *testing.T) {
 	dir := makeWorkTree(t)
 	chdir(t, dir)
 	must(t, cmdInit())
-	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdRemote(ctx, []string{"set", remoteURL}))
 
 	// Commit 1: initial files.
 	must(t, cmdCommit(ctx, []string{"-m", "first"}))
@@ -1139,7 +1139,7 @@ func TestGCRefusesToDeleteBlobsNotOnRemote(t *testing.T) {
 	dir := makeWorkTree(t)
 	chdir(t, dir)
 	must(t, cmdInit())
-	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdRemote(ctx, []string{"set", remoteURL}))
 
 	// Commit 1: push so remote knows about these blobs.
 	must(t, cmdCommit(ctx, []string{"-m", "first"}))
@@ -1190,7 +1190,7 @@ func TestGCThenCheckoutOldCommitViaPull(t *testing.T) {
 	dir := makeWorkTree(t)
 	chdir(t, dir)
 	must(t, cmdInit())
-	must(t, cmdRemote([]string{"set", remoteURL}))
+	must(t, cmdRemote(ctx, []string{"set", remoteURL}))
 
 	// Commit 1.
 	must(t, cmdCommit(ctx, []string{"-m", "first"}))

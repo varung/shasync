@@ -465,7 +465,7 @@ func cmdLog(ctx context.Context, args []string) error {
 		if c.Remote == "" {
 			return fmt.Errorf("no remote set — run: shasync remote set <url>")
 		}
-		r, err := newRemote(ctx, c.Remote)
+		r, err := newRemote(ctx, c)
 		if err != nil {
 			return err
 		}
@@ -912,7 +912,7 @@ func cmdLs(ctx context.Context, args []string) error {
 	if c.Remote == "" {
 		return fmt.Errorf("no remote set — run: shasync remote set <url>")
 	}
-	r, err := newRemote(ctx, c.Remote)
+	r, err := newRemote(ctx, c)
 	if err != nil {
 		return err
 	}
@@ -932,24 +932,32 @@ func cmdLs(ctx context.Context, args []string) error {
 	return nil
 }
 
-func cmdRemote(args []string) error {
+func cmdRemote(ctx context.Context, args []string) error {
 	s, err := findStore()
 	if err != nil {
 		return err
 	}
 	if len(args) == 0 {
-		return fmt.Errorf("usage: shasync remote set <url> | shasync remote show")
+		return fmt.Errorf("usage: shasync remote {set|show|migrate} ...")
 	}
 	switch args[0] {
 	case "set":
-		if len(args) != 2 {
-			return fmt.Errorf("usage: shasync remote set <url>")
+		fs := flag.NewFlagSet("remote set", flag.ExitOnError)
+		profile := fs.String("profile", "", "AWS/R2 credentials profile name (from ~/.aws/credentials)")
+		endpoint := fs.String("endpoint", "", "custom S3 endpoint URL (e.g. https://<acct>.r2.cloudflarestorage.com)")
+		virtualHosted := fs.Bool("virtual-hosted-style", false, "use virtual-hosted-style S3 URLs (default is path-style)")
+		_ = fs.Parse(args[1:])
+		if fs.NArg() != 1 {
+			return fmt.Errorf("usage: shasync remote set <url> [--profile NAME] [--endpoint URL]")
 		}
 		c, err := s.readConfig()
 		if err != nil {
 			return err
 		}
-		c.Remote = args[1]
+		c.Remote = fs.Arg(0)
+		c.S3Profile = *profile
+		c.S3Endpoint = *endpoint
+		c.S3VirtualHostedStyle = *virtualHosted
 		return s.writeConfig(c)
 	case "show":
 		c, err := s.readConfig()
@@ -960,11 +968,130 @@ func cmdRemote(args []string) error {
 			fmt.Println("(no remote set)")
 		} else {
 			fmt.Println(c.Remote)
+			if c.S3Endpoint != "" {
+				fmt.Printf("  endpoint:         %s\n", c.S3Endpoint)
+			}
+			if c.S3Profile != "" {
+				fmt.Printf("  profile:          %s\n", c.S3Profile)
+			}
+			if c.S3VirtualHostedStyle {
+				fmt.Println("  virtual-hosted-style: true")
+			}
 		}
 		return nil
+	case "migrate":
+		return cmdRemoteMigrate(ctx, s, args[1:])
 	default:
 		return fmt.Errorf("unknown subcommand: remote %s", args[0])
 	}
+}
+
+func cmdRemoteMigrate(ctx context.Context, s *Store, args []string) error {
+	fs := flag.NewFlagSet("remote migrate", flag.ExitOnError)
+	profile := fs.String("profile", "", "AWS/R2 credentials profile name for the new remote")
+	endpoint := fs.String("endpoint", "", "custom S3 endpoint URL for the new remote")
+	virtualHosted := fs.Bool("virtual-hosted-style", false, "use virtual-hosted-style S3 URLs (default is path-style)")
+	_ = fs.Parse(args)
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: shasync remote migrate <new-url> [--profile NAME] [--endpoint URL]")
+	}
+	newURL := fs.Arg(0)
+
+	oldCfg, err := s.readConfig()
+	if err != nil {
+		return err
+	}
+	if oldCfg.Remote == "" {
+		return fmt.Errorf("no remote configured — nothing to migrate from")
+	}
+	src, err := newRemote(ctx, oldCfg)
+	if err != nil {
+		return fmt.Errorf("open old remote: %w", err)
+	}
+
+	dstCfg := &Config{
+		Remote:               newURL,
+		S3Profile:            *profile,
+		S3Endpoint:           *endpoint,
+		S3VirtualHostedStyle: *virtualHosted,
+	}
+	dst, err := newRemote(ctx, dstCfg)
+	if err != nil {
+		return fmt.Errorf("open new remote: %w", err)
+	}
+
+	blobKeys, err := src.List(ctx, "blobs/")
+	if err != nil {
+		return fmt.Errorf("list blobs on old remote: %w", err)
+	}
+	manKeys, err := src.List(ctx, "manifests/")
+	if err != nil {
+		return fmt.Errorf("list manifests on old remote: %w", err)
+	}
+
+	keys := make([]string, 0, len(blobKeys)+len(manKeys))
+	keys = append(keys, blobKeys...)
+	keys = append(keys, manKeys...)
+
+	var copied int64
+	var mu sync.Mutex
+	if err := parallelFor(ctx, 16, keys, func(ctx context.Context, key string) error {
+		exists, err := dst.Exists(ctx, key)
+		if err != nil {
+			return fmt.Errorf("check %s on new remote: %w", key, err)
+		}
+		if exists {
+			return nil
+		}
+		rc, err := src.Download(ctx, key)
+		if err != nil {
+			return fmt.Errorf("download %s: %w", key, err)
+		}
+		defer rc.Close()
+		data, err := io.ReadAll(rc)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", key, err)
+		}
+		if err := dst.Upload(ctx, key, bytes.NewReader(data)); err != nil {
+			return fmt.Errorf("upload %s: %w", key, err)
+		}
+		mu.Lock()
+		copied++
+		mu.Unlock()
+		return nil
+	}); err != nil {
+		return err
+	}
+	fmt.Printf("copied %d object(s) (%d blobs, %d manifests; %d already present)\n",
+		copied, len(blobKeys), len(manKeys), int64(len(keys))-copied)
+
+	for _, special := range []string{remoteHeadKey, remoteSaltKey()} {
+		rc, err := src.Download(ctx, special)
+		if err != nil {
+			continue
+		}
+		data, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			continue
+		}
+		if err := dst.Upload(ctx, special, bytes.NewReader(data)); err != nil {
+			return fmt.Errorf("upload %s: %w", special, err)
+		}
+		fmt.Printf("copied %s\n", special)
+	}
+
+	oldCfg.Remote = newURL
+	oldCfg.S3Profile = *profile
+	oldCfg.S3Endpoint = *endpoint
+	oldCfg.S3VirtualHostedStyle = *virtualHosted
+	if err := s.writeConfig(oldCfg); err != nil {
+		return fmt.Errorf("update config: %w", err)
+	}
+	_ = os.Remove(s.pushLogCachePath())
+
+	fmt.Printf("migrated to %s\n", newURL)
+	return nil
 }
 
 // --- key ---
@@ -1002,7 +1129,7 @@ func cmdKey(ctx context.Context, args []string) error {
 		if c.Remote == "" {
 			return fmt.Errorf("configure a remote first (shasync remote set <url>) — the salt is stored in the bucket so all machines derive the same key")
 		}
-		r, err := newRemote(ctx, c.Remote)
+		r, err := newRemote(ctx, c)
 		if err != nil {
 			return err
 		}
@@ -1053,7 +1180,7 @@ func cmdKey(ctx context.Context, args []string) error {
 		if c.Remote == "" {
 			return fmt.Errorf("no remote set — cannot fetch salt")
 		}
-		r, err := newRemote(ctx, c.Remote)
+		r, err := newRemote(ctx, c)
 		if err != nil {
 			return err
 		}
@@ -1108,7 +1235,7 @@ func cmdGC(ctx context.Context, args []string) error {
 	if c.Remote == "" {
 		return fmt.Errorf("no remote set — gc needs a remote to verify blobs exist before deleting locally")
 	}
-	r, err := newRemote(ctx, c.Remote)
+	r, err := newRemote(ctx, c)
 	if err != nil {
 		return err
 	}
@@ -1264,7 +1391,7 @@ func cmdPush(ctx context.Context, args []string) error {
 		return err
 	}
 	passphraseNudge(s)
-	r, err := newRemote(ctx, c.Remote)
+	r, err := newRemote(ctx, c)
 	if err != nil {
 		return err
 	}
@@ -1701,7 +1828,7 @@ func cmdPull(ctx context.Context, args []string) error {
 		return err
 	}
 	passphraseNudge(s)
-	r, err := newRemote(ctx, c.Remote)
+	r, err := newRemote(ctx, c)
 	if err != nil {
 		return err
 	}

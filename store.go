@@ -107,6 +107,10 @@ type Config struct {
 	// it survives laptop renames and doesn't collide across machines with
 	// the same OS-level hostname.
 	ClientID string `json:"client_id,omitempty"`
+
+	S3Endpoint          string `json:"s3_endpoint,omitempty"`
+	S3Profile           string `json:"s3_profile,omitempty"`
+	S3VirtualHostedStyle bool  `json:"s3_virtual_hosted_style,omitempty"`
 }
 
 // newClientID returns 8 hex chars (32 bits of entropy) — enough for a

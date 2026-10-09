@@ -36,7 +36,7 @@ func cmdWatch(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	r, err := newRemote(ctx, c.Remote)
+	r, err := newRemote(ctx, c)
 	if err != nil {
 		return err
 	}
