@@ -53,15 +53,15 @@ func (s *Store) walkWorkingDir() ([]string, error) {
 }
 
 func (s *Store) readIgnore() ([]string, error) {
+	pats := append([]string(nil), defaultIgnores...)
 	f, err := os.Open(filepath.Join(s.Root, ignoreFile))
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
+		return pats, nil
 	}
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	var pats []string
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())

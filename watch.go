@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io/fs"
@@ -198,7 +199,12 @@ func fetchAndCheckout(ctx context.Context, r Remote, s *Store, cryptKey []byte, 
 	}); err != nil {
 		return err
 	}
-	return checkoutTarget(s, target, true)
+	// Never force: the user may have saved files since this cycle's snapshot.
+	from, err := s.readHead()
+	if err != nil {
+		return err
+	}
+	return applyManifestSafely(s, from, target)
 }
 
 func syncAndLog(ctx context.Context, s *Store, r Remote, cryptKey []byte, c *Config) {
@@ -206,6 +212,10 @@ func syncAndLog(ctx context.Context, s *Store, r Remote, cryptKey []byte, c *Con
 	err := syncOnce(ctx, s, r, cryptKey, c)
 	after, _ := s.readHead()
 	stamp := time.Now().Format("15:04:05")
+	if errors.Is(err, errLocalEditsDuringSync) {
+		fmt.Printf("\r\033[K%s  %v\n", stamp, err)
+		return
+	}
 	if err != nil {
 		if ctx.Err() != nil {
 			return

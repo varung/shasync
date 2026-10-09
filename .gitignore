@@ -12,3 +12,7 @@
 # test-time scratch (none expected, but in case)
 /tmp_test_*
 /myvcs
+
+# Cloudflare wrangler state (account details) and the compiled slides tool
+/.wrangler/
+/slides

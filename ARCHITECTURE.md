@@ -297,6 +297,27 @@ local store.
 
 ---
 
+### 8.1 Applying remote changes during `watch`
+
+`watch` snapshots the tree, then spends network time before it applies the
+remote side, and an editor may save in that window. So the watch cycle never
+force-checks-out. `applyManifestSafely` (syncsafe.go) moves the tree from the
+manifest it snapshotted to the target, touching only paths that differ. Each
+path is replaced or removed only if it still holds its snapshotted content at
+that moment, and files the snapshot didn't know about are never deleted. If an
+edited path is in the way, the cycle stops with `errLocalEditsDuringSync`; the
+next cycle commits the edit and merges it. A real conflict becomes the usual
+`(modified on …)` copy. `syncsafe_test.go` covers this with an in-memory remote
+that saves files mid-download.
+
+### 8.2 Default ignores
+
+Editor and OS litter never syncs, on top of `.blobsignore`: `.DS_Store`, `._*`,
+vim swap/backup files and its `4913` write test, Emacs `.#*`/`#*#`, and temp
+files from atomic saves (`.tmp-*`, `.dat.nosync*`). See `defaultIgnores`.
+
+---
+
 ## 9. Encryption
 
 ### 9.1 What gets encrypted
