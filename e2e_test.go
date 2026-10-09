@@ -16,6 +16,24 @@ import (
 )
 
 // makeWorkTree creates a scratch working directory with some files.
+// testKeyHex is a fixed repo key for tests that aren't about key handling:
+// every remote needs one, since shasync always encrypts.
+const testKeyHex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+
+func useTestKey(t *testing.T) {
+	t.Helper()
+	t.Setenv("SHASYNC_KEY", testKeyHex)
+}
+
+func testKey(t *testing.T) []byte {
+	t.Helper()
+	k, err := decodeHexKey(testKeyHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return k
+}
+
 func makeWorkTree(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -99,6 +117,7 @@ func TestCommitAndCheckoutRoundTrip(t *testing.T) {
 // --- S3 emulator round-trip. ---
 
 func TestPushPullViaS3Emulator(t *testing.T) {
+	useTestKey(t)
 	backend := s3mem.New()
 	faker := gofakes3.New(backend)
 	srv := httptest.NewServer(faker.Server())
@@ -121,6 +140,7 @@ func TestPushPullViaS3Emulator(t *testing.T) {
 // --- GCS emulator round-trip. ---
 
 func TestPushPullViaGCSEmulator(t *testing.T) {
+	useTestKey(t)
 	srv, err := fakestorage.NewServerWithOptions(fakestorage.Options{
 		Scheme: "http",
 		Host:   "127.0.0.1",
@@ -453,6 +473,7 @@ func newS3Fake(t *testing.T, bucket string) string {
 // TestPullNoArgsFetchesRemoteHead: clean-clone scenario — pull with no SHA
 // reads remote HEAD, fetches everything, and leaves the working tree synced.
 func TestPullNoArgsFetchesRemoteHead(t *testing.T) {
+	useTestKey(t)
 	newS3Fake(t, "shasync-test")
 	ctx := context.Background()
 	remoteURL := "s3://shasync-test/sync-project"
@@ -491,6 +512,7 @@ func TestPullNoArgsFetchesRemoteHead(t *testing.T) {
 // TestLogRemoteWalksChain: push a few commits, then verify log --remote
 // walks the chain in reverse-chronological order.
 func TestLogRemoteWalksChain(t *testing.T) {
+	useTestKey(t)
 	newS3Fake(t, "shasync-test")
 	ctx := context.Background()
 	remoteURL := "s3://shasync-test/log-project"
@@ -531,6 +553,7 @@ func TestLogRemoteWalksChain(t *testing.T) {
 // tagged with the local client's ID, and checks it out; a second push is
 // then a plain fast-forward. A third machine pulls and sees the same state.
 func TestDivergentPushRefusesPullMerges(t *testing.T) {
+	useTestKey(t)
 	newS3Fake(t, "shasync-test")
 	ctx := context.Background()
 	remoteURL := "s3://shasync-test/merge-project"
@@ -675,6 +698,7 @@ func listDir(t *testing.T, dir string) {
 // TestFastForwardPush: typical single-user flow — commit on A, push, pull on
 // B, commit on B, push. B's push is a fast-forward that extends remote.
 func TestFastForwardPush(t *testing.T) {
+	useTestKey(t)
 	newS3Fake(t, "shasync-test")
 	ctx := context.Background()
 	remoteURL := "s3://shasync-test/ff-project"
@@ -709,6 +733,7 @@ func TestFastForwardPush(t *testing.T) {
 // for recovery (wipe remote, publish a known-good local tip) — we verify it
 // successfully overwrites even when local is strictly behind.
 func TestPushForceOverwritesRemote(t *testing.T) {
+	useTestKey(t)
 	newS3Fake(t, "shasync-test")
 	ctx := context.Background()
 	remoteURL := "s3://shasync-test/force-project"
@@ -795,6 +820,7 @@ func TestPullAndLogOnEmptyRemote(t *testing.T) {
 // upload it, and advance remote HEAD. No "nothing to push" error, no
 // silently-ignored edits.
 func TestPushAutoCommitsDirtyTree(t *testing.T) {
+	useTestKey(t)
 	newS3Fake(t, "shasync-test")
 	ctx := context.Background()
 	remoteURL := "s3://shasync-test/autocommit-project"
@@ -869,6 +895,7 @@ func TestPushAutoCommitsDirtyTree(t *testing.T) {
 //   - A third fresh clone pulling from scratch sees identical state.
 //   - No work is lost — both sides' blobs survive as a sibling pair.
 func TestTwoFoldersImplicitCommitFlow(t *testing.T) {
+	useTestKey(t)
 	newS3Fake(t, "shasync-test")
 	ctx := context.Background()
 	remoteURL := "s3://shasync-test/two-folder-project"
@@ -1053,6 +1080,7 @@ func TestClientIDStableAcrossRuns(t *testing.T) {
 // --- GC: delete local blobs already on the remote ---
 
 func TestGCDeletesOldBlobsKeepsHEAD(t *testing.T) {
+	useTestKey(t)
 	backend := s3mem.New()
 	faker := gofakes3.New(backend)
 	srv := httptest.NewServer(faker.Server())
@@ -1120,6 +1148,7 @@ func TestGCDeletesOldBlobsKeepsHEAD(t *testing.T) {
 }
 
 func TestGCRefusesToDeleteBlobsNotOnRemote(t *testing.T) {
+	useTestKey(t)
 	backend := s3mem.New()
 	faker := gofakes3.New(backend)
 	srv := httptest.NewServer(faker.Server())
@@ -1171,6 +1200,7 @@ func TestGCRefusesToDeleteBlobsNotOnRemote(t *testing.T) {
 }
 
 func TestGCThenCheckoutOldCommitViaPull(t *testing.T) {
+	useTestKey(t)
 	backend := s3mem.New()
 	faker := gofakes3.New(backend)
 	srv := httptest.NewServer(faker.Server())

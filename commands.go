@@ -479,7 +479,7 @@ func cmdLog(ctx context.Context, args []string) error {
 		}
 		// Fetch manifests for the chain so we can render it, but only as many
 		// as `-n` asks for (bounded network cost).
-		cryptKey, err := s.loadKey()
+		cryptKey, err := s.requireKey()
 		if err != nil {
 			return err
 		}
@@ -996,6 +996,9 @@ func cmdRemoteMigrate(ctx context.Context, s *Store, args []string) error {
 		return fmt.Errorf("usage: shasync remote migrate <new-url> [--profile NAME] [--endpoint URL]")
 	}
 	newURL := fs.Arg(0)
+	if _, err := s.requireKey(); err != nil {
+		return err
+	}
 
 	oldCfg, err := s.readConfig()
 	if err != nil {
@@ -1051,6 +1054,9 @@ func cmdRemoteMigrate(ctx context.Context, s *Store, args []string) error {
 		data, err := io.ReadAll(rc)
 		if err != nil {
 			return fmt.Errorf("read %s: %w", key, err)
+		}
+		if !isEncryptedObject(data) {
+			return fmt.Errorf("%s on the old remote is not encrypted — not copying it", key)
 		}
 		if err := dst.Upload(ctx, key, bytes.NewReader(data)); err != nil {
 			return fmt.Errorf("upload %s: %w", key, err)
@@ -1386,7 +1392,7 @@ func cmdPush(ctx context.Context, args []string) error {
 	if c.Remote == "" {
 		return fmt.Errorf("no remote set — run: shasync remote set <url>")
 	}
-	cryptKey, err := s.loadKey()
+	cryptKey, err := s.requireKey()
 	if err != nil {
 		return err
 	}
@@ -1823,7 +1829,7 @@ func cmdPull(ctx context.Context, args []string) error {
 	if c.Remote == "" {
 		return fmt.Errorf("no remote set — run: shasync remote set <url>")
 	}
-	cryptKey, err := s.loadKey()
+	cryptKey, err := s.requireKey()
 	if err != nil {
 		return err
 	}
@@ -1984,11 +1990,17 @@ func uploadFile(ctx context.Context, r Remote, cryptKey []byte, localPath, remot
 	if err != nil {
 		return err
 	}
-	if cryptKey != nil {
-		data, err = encryptBytes(cryptKey, data)
-		if err != nil {
-			return err
-		}
+	// Content never leaves unencrypted: no key is an error, and the bytes about
+	// to be sent must carry the SHAS header (guards against a bug upstream).
+	if len(cryptKey) == 0 {
+		return fmt.Errorf("refusing to upload %s: %w", remoteKey, errNoKey)
+	}
+	data, err = encryptBytes(cryptKey, data)
+	if err != nil {
+		return err
+	}
+	if !isEncryptedObject(data) {
+		return fmt.Errorf("refusing to upload %s: encryption produced no SHAS header", remoteKey)
 	}
 	return r.Upload(ctx, remoteKey, bytes.NewReader(data))
 }
@@ -2009,11 +2021,17 @@ func downloadAndStore(ctx context.Context, r Remote, cryptKey []byte, remoteKey,
 	if err != nil {
 		return err
 	}
-	if cryptKey != nil && len(data) >= 5 && (string(data[:5]) == cryptMagicV2 || string(data[:5]) == cryptMagicV1) {
-		data, err = decryptBytes(cryptKey, data)
-		if err != nil {
-			return fmt.Errorf("%s: %w", remoteKey, err)
-		}
+	// Remotes are always encrypted; a plaintext object means something wrote
+	// to the bucket without shasync's encryption, so don't trust it.
+	if len(cryptKey) == 0 {
+		return fmt.Errorf("%s: %w", remoteKey, errNoKey)
+	}
+	if !isEncryptedObject(data) {
+		return fmt.Errorf("%s is not encrypted — shasync only accepts encrypted remotes", remoteKey)
+	}
+	data, err = decryptBytes(cryptKey, data)
+	if err != nil {
+		return fmt.Errorf("%s: %w", remoteKey, err)
 	}
 	if isZstd(data) {
 		data, err = decompressZstd(data)

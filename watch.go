@@ -33,7 +33,7 @@ func cmdWatch(ctx context.Context, args []string) error {
 	if c.Remote == "" {
 		return fmt.Errorf("no remote set — run: shasync remote set <url>")
 	}
-	cryptKey, err := s.loadKey()
+	cryptKey, err := s.requireKey()
 	if err != nil {
 		return err
 	}

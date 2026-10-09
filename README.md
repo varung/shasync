@@ -11,7 +11,8 @@ beyond what your bucket allows. It's a single binary with no dependencies.
   other machines
 - **Works with any cloud** — bring your own S3 bucket (AWS, Cloudflare R2,
   MinIO, etc.) or GCS bucket. One bucket can host many projects.
-- **End-to-end encrypted** — optional AES-256-GCM encryption. Your cloud
+- **Always end-to-end encrypted** — every blob and manifest is AES-256-GCM
+  encrypted before upload; shasync refuses to sync without a key. Your cloud
   provider never sees plaintext. Key never leaves your machines.
 - **Handles large files natively** — no git-lfs needed. Copy-on-write
   reflinks (APFS, Btrfs, XFS) mean a 5GB video takes no extra disk space
@@ -56,6 +57,7 @@ cd shasync && go install .
 mkdir my-project && cd my-project
 shasync init
 shasync remote set s3://my-bucket/my-project
+shasync key set-passphrase      # required: shasync always encrypts
 
 # Add files and push
 echo "hello" > notes.txt
@@ -65,6 +67,7 @@ shasync push                    # auto-commits dirty files, uploads to S3
 mkdir my-project && cd my-project
 shasync init
 shasync remote set s3://my-bucket/my-project
+shasync key set-passphrase      # same passphrase as machine A
 shasync pull                    # downloads and materializes files
 ```
 
@@ -116,8 +119,11 @@ shasync key set-passphrase      # Argon2id derivation; same passphrase on each m
 shasync key gen                 # random key; copy .blobs/key to other machines
 ```
 
-When a key is configured, all blobs and manifests are AES-256-GCM
-encrypted before upload and verified on download. The key never touches
+Every repo needs a key: `push`, `pull`, `watch`, `log --remote` and
+`remote migrate` refuse to run without one, the upload path refuses to send
+anything that isn't encrypted, and downloads refuse objects that aren't. All
+blobs and manifests are AES-256-GCM encrypted before upload and verified on
+download. The key never touches
 the remote. Wire format is chunked (64 KiB) to support range reads.
 
 ## Compression
@@ -149,7 +155,7 @@ Verify it works on your filesystem: `shasync test-cow`
   .blobs/
     HEAD                             # current manifest SHA
     config.json                      # { "remote": "s3://..." }
-    key                              # hex AES-256 key (optional)
+    key                              # hex AES-256 key (required to sync)
     objects/<sha[:2]>/<sha[2:]>      # immutable content-addressed blobs
     manifests/<sha[:2]>/<sha[2:]>.json
 ```

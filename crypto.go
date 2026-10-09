@@ -87,6 +87,28 @@ func (s *Store) loadKey() ([]byte, error) {
 	return decodeHexKey(strings.TrimSpace(string(b)))
 }
 
+// errNoKey: shasync never talks to a remote unencrypted.
+var errNoKey = errors.New("no encryption key — shasync always encrypts, so every repo needs one:\n" +
+	"  shasync key set-passphrase   derive it from a passphrase (same on every machine)\n" +
+	"  shasync key gen              random key; copy .blobs/key to your other machines")
+
+// requireKey is loadKey for anything that touches a remote: no key, no sync.
+func (s *Store) requireKey() ([]byte, error) {
+	k, err := s.loadKey()
+	if err != nil {
+		return nil, err
+	}
+	if len(k) == 0 {
+		return nil, errNoKey
+	}
+	return k, nil
+}
+
+// isEncryptedObject reports whether stored bytes carry the SHAS header.
+func isEncryptedObject(data []byte) bool {
+	return len(data) >= 5 && (string(data[:5]) == cryptMagicV2 || string(data[:5]) == cryptMagicV1)
+}
+
 func decodeHexKey(s string) ([]byte, error) {
 	b, err := hex.DecodeString(s)
 	if err != nil {

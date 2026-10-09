@@ -1,6 +1,6 @@
 # shasync architecture
 
-A content-addressed folder snapshot tool with optional client-side
+A content-addressed folder snapshot tool with mandatory client-side
 encryption. Roughly: "a tiny git for syncing a folder across machines,
 designed to also be reachable from a browser."
 
@@ -19,7 +19,7 @@ features (chiefly: in-browser access).
 - Preserve full history (git-like parent chain of snapshots).
 - Content-addressed deduplication: identical bytes in two files, two
   commits, or two clients upload exactly once.
-- Optional end-to-end encryption such that a leaked bucket is still
+- Mandatory end-to-end encryption such that a leaked bucket is still
   unreadable. Threat model: accidental bucket exposure — not a
   compromised key.
 - Wire format that a browser can consume with just `fetch()` + the
@@ -66,7 +66,7 @@ The three layers of state:
 1. **Working tree** — the user's actual files, editable.
 2. **Local store** at `.blobs/` — immutable content-addressed
    artifacts plus a pointer (`HEAD`) and some config.
-3. **Remote** — the same artifacts uploaded to a bucket, optionally
+3. **Remote** — the same artifacts uploaded to a bucket, always
    encrypted.
 
 Content addressing is the spine: every blob is named by `sha256(
@@ -84,7 +84,7 @@ Nothing is ever rewritten; garbage collection is by prefix deletion.
   .blobs/
     HEAD                        "<64 hex chars>\n" — the current manifest SHA
     config.json                 { "remote": "s3://bucket/prefix" }
-    key                         hex-encoded 32-byte AES-256 key (chmod 600; optional)
+    key                         hex-encoded 32-byte AES-256 key (chmod 600; required to sync)
     objects/<ab>/<cdef...>      file blobs, sharded by first 2 hex chars
     manifests/<ab>/<cdef...>.json
 ```
@@ -405,12 +405,19 @@ Does NOT protect against:
 - Side channels: ciphertext sizes leak file sizes; upload timing
   leaks commit patterns.
 
-### 9.6 Mixed mode
+### 9.6 Encryption is mandatory
 
-A given prefix should be either all-encrypted or all-plaintext.
-Pulling an encrypted object without a key — or a plaintext object
-with a key — errors out with a clear message rather than silently
-producing garbage.
+There is no plaintext mode. Every command that touches a remote gets its key
+from `requireKey`, which fails with instructions when none is set. Underneath
+that, `uploadFile` — the only path content takes to the bucket — refuses a
+missing key and checks that the bytes it's about to send carry the SHAS header,
+and `downloadAndStore` refuses any object without one. `remote migrate` copies
+only encrypted objects. So a machine that loses its key (deleted `.blobs/key`,
+an unset `SHASYNC_KEY`) stops syncing instead of quietly uploading plaintext.
+`HEAD`, `salt` and push-log entries stay plaintext: they hold hashes and
+timing, not content. The `TestKeyless…`, `TestEverythingUploadedIsEncrypted`
+and `TestPlaintextObjectInBucketIsRefused` tests in syncsafe_test.go pin this
+down.
 
 ---
 

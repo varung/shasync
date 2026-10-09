@@ -42,6 +42,7 @@ COMMANDS
         [--poll <dur>]          debounce: quiet period (default 2s)
                                 poll: remote check interval (default 30s)
   key gen                       generate a random 32-byte repo encryption key
+                                (every repo needs a key: shasync always encrypts)
   key set-passphrase            derive a key from a passphrase via Argon2id
   key verify                    check you still remember your passphrase
   key show                      print the configured encryption key (or "none")

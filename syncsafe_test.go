@@ -98,7 +98,7 @@ func (m machineT) get(name string) string {
 // sync runs one watch cycle; edits during the cycle may make it stop early.
 func (m machineT) sync(t *testing.T, r Remote) {
 	t.Helper()
-	if err := syncOnce(context.Background(), m.s, r, nil, m.c); err != nil && err != errLocalEditsDuringSync {
+	if err := syncOnce(context.Background(), m.s, r, testKey(t), m.c); err != nil && err != errLocalEditsDuringSync {
 		t.Fatal(err)
 	}
 }
@@ -116,7 +116,7 @@ func twoMachines(t *testing.T, files map[string]string) (*memRemote, machineT, m
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := fetchAndCheckout(context.Background(), r, a.s, nil, head); err != nil {
+	if err := fetchAndCheckout(context.Background(), r, a.s, testKey(t), head); err != nil {
 		t.Fatal(err)
 	}
 	return r, a, b
@@ -201,4 +201,114 @@ func TestDefaultIgnoresKeepEditorLitterLocal(t *testing.T) {
 	if got := sortedKeys(man.Files); len(got) != 1 || got[0] != "note.md" {
 		t.Errorf("synced files = %v, want only note.md", got)
 	}
+}
+
+// --- Encryption is mandatory ----------------------------------------------
+
+// snapshotBucket copies the remote's objects, to prove an operation changed nothing.
+func (m *memRemote) snapshotBucket() map[string]string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := map[string]string{}
+	for k, v := range m.objs {
+		out[k] = string(v)
+	}
+	return out
+}
+
+// A machine that has lost its key — even one holding the whole history
+// locally — must not push anything, let alone plaintext.
+func TestKeylessMachineCannotPush(t *testing.T) {
+	r, a, _ := twoMachines(t, map[string]string{"secret.md": "v1\n"})
+	a.put(t, "secret.md", "a private edit\n")
+	before := r.snapshotBucket()
+
+	err := syncOnce(context.Background(), a.s, r, nil, a.c)
+	if err == nil {
+		t.Fatal("sync without a key succeeded")
+	}
+	if !strings.Contains(err.Error(), "no encryption key") {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if after := r.snapshotBucket(); len(after) != len(before) {
+		t.Errorf("bucket changed: %d objects before, %d after", len(before), len(after))
+	}
+	for k, v := range r.snapshotBucket() {
+		if strings.Contains(v, "a private edit") {
+			t.Fatalf("plaintext reached the bucket at %s", k)
+		}
+	}
+}
+
+// Every blob and manifest that reaches the bucket is encrypted.
+func TestEverythingUploadedIsEncrypted(t *testing.T) {
+	r, a, b := twoMachines(t, map[string]string{"one.md": "first note\n", "two.md": "second note\n"})
+	a.put(t, "three.md", "third note\n")
+	a.sync(t, r)
+	b.sync(t, r)
+	var checked int
+	for k, v := range r.snapshotBucket() {
+		if !strings.HasPrefix(k, "blobs/") && !strings.HasPrefix(k, "manifests/") {
+			continue // HEAD, salt and push-log hold hashes, not content
+		}
+		checked++
+		if !isEncryptedObject([]byte(v)) {
+			t.Errorf("%s is not encrypted", k)
+		}
+		for _, secret := range []string{"first note", "second note", "third note", ".md"} {
+			if strings.Contains(v, secret) {
+				t.Errorf("%s contains plaintext %q", k, secret)
+			}
+		}
+	}
+	if checked < 5 {
+		t.Fatalf("only %d content objects checked", checked)
+	}
+}
+
+// A plaintext object in the bucket (written by anything but shasync) is
+// refused rather than trusted.
+func TestPlaintextObjectInBucketIsRefused(t *testing.T) {
+	r, _, b := twoMachines(t, map[string]string{"note.md": "v1\n"})
+	plain := "planted plaintext\n"
+	sha, _, err := hashBytesForTest(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.objs["blobs/"+sha] = []byte(plain)
+	err = downloadBlob(context.Background(), r, b.s, testKey(t), sha)
+	if err == nil || !strings.Contains(err.Error(), "not encrypted") {
+		t.Fatalf("plaintext blob accepted (err = %v)", err)
+	}
+}
+
+// The commands themselves refuse to start without a key.
+func TestCommandsRequireKey(t *testing.T) {
+	t.Setenv("SHASYNC_KEY", "")
+	m := newMachine(t, "m")
+	if _, err := m.s.requireKey(); err == nil {
+		t.Fatal("requireKey succeeded with no key")
+	}
+	m.put(t, "note.md", "private\n")
+	r := &memRemote{objs: map[string][]byte{}}
+	err := uploadFile(context.Background(), r, nil, filepath.Join(m.s.Root, "note.md"), "blobs/x")
+	if err == nil || !strings.Contains(err.Error(), "no encryption key") {
+		t.Fatalf("uploadFile with a nil key: err = %v", err)
+	}
+	if len(r.objs) != 0 {
+		t.Fatal("uploadFile with a nil key wrote to the bucket")
+	}
+}
+
+func hashBytesForTest(s string) (string, int64, error) {
+	f, err := os.CreateTemp("", "shasync-hash-*")
+	if err != nil {
+		return "", 0, err
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.WriteString(s); err != nil {
+		return "", 0, err
+	}
+	f.Close()
+	return hashFile(f.Name())
 }
