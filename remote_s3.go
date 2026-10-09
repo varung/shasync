@@ -17,9 +17,11 @@ import (
 )
 
 type s3Remote struct {
-	client *s3.Client
-	bucket string
-	prefix string
+	client         *s3.Client
+	bucket         string
+	prefix         string
+	awsCfg         aws.Config // for the bucket privacy check (STS identity)
+	customEndpoint string     // non-AWS S3 (R2, MinIO…): privacy can't be checked here
 }
 
 func newS3Remote(ctx context.Context, bucket, prefix string, appCfg *Config) (Remote, error) {
@@ -58,7 +60,8 @@ func newS3Remote(ctx context.Context, bucket, prefix string, appCfg *Config) (Re
 		}
 	}
 	c := s3.NewFromConfig(cfg, optFns...)
-	return &s3Remote{client: c, bucket: bucket, prefix: strings.TrimSuffix(prefix, "/")}, nil
+	return &s3Remote{client: c, bucket: bucket, prefix: strings.TrimSuffix(prefix, "/"),
+		awsCfg: cfg, customEndpoint: customEndpoint}, nil
 }
 
 func firstNonEmpty(vals ...string) string {

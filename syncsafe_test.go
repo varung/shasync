@@ -312,3 +312,47 @@ func hashBytesForTest(s string) (string, int64, error) {
 	f.Close()
 	return hashFile(f.Name())
 }
+
+// --- Bucket privacy check -------------------------------------------------
+
+type fakeAuditedRemote struct {
+	memRemote
+	report *bucketReport
+}
+
+func (f *fakeAuditedRemote) auditBucket(context.Context) *bucketReport { return f.report }
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	old := os.Stdout
+	rd, wr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = wr
+	fn()
+	wr.Close()
+	os.Stdout = old
+	out, _ := io.ReadAll(rd)
+	return string(out)
+}
+
+func TestBucketCheckWarnsWhenPublic(t *testing.T) {
+	r := &fakeAuditedRemote{report: &bucketReport{Bucket: "b",
+		Public: []string{"the ACL grants READ to EVERYONE"},
+		Risks:  []string{"these are the AWS account's ROOT access keys — use an IAM user limited to this bucket instead"}}}
+	out := captureStdout(t, func() { checkBucketBeforeSync(context.Background(), r) })
+	for _, want := range []string{"MAY BE PUBLIC", "READ to EVERYONE", "ROOT access keys"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestBucketCheckQuietWhenPrivate(t *testing.T) {
+	r := &fakeAuditedRemote{report: &bucketReport{Bucket: "b", Facts: []string{"Block Public Access: all on"}}}
+	out := captureStdout(t, func() { checkBucketBeforeSync(context.Background(), r) })
+	if strings.TrimSpace(out) != "bucket b: private ✓" {
+		t.Errorf("unexpected output: %q", out)
+	}
+}

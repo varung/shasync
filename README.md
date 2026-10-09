@@ -11,6 +11,11 @@ beyond what your bucket allows. It's a single binary with no dependencies.
   other machines
 - **Works with any cloud** — bring your own S3 bucket (AWS, Cloudflare R2,
   MinIO, etc.) or GCS bucket. One bucket can host many projects.
+- **Checks the bucket is private** — before every push and when `watch`
+  starts, shasync inspects the bucket (Block Public Access, bucket policy,
+  ACLs, website hosting) and warns loudly if anything could make it public.
+  It also warns if you're using the AWS account's root keys.
+  `shasync remote check` prints the full report.
 - **Always end-to-end encrypted** — every blob and manifest is AES-256-GCM
   encrypted before upload; shasync refuses to sync without a key. Your cloud
   provider never sees plaintext. Key never leaves your machines.

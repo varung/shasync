@@ -938,7 +938,7 @@ func cmdRemote(ctx context.Context, args []string) error {
 		return err
 	}
 	if len(args) == 0 {
-		return fmt.Errorf("usage: shasync remote {set|show|migrate} ...")
+		return fmt.Errorf("usage: shasync remote {set|show|check|migrate} ...")
 	}
 	switch args[0] {
 	case "set":
@@ -981,6 +981,25 @@ func cmdRemote(ctx context.Context, args []string) error {
 		return nil
 	case "migrate":
 		return cmdRemoteMigrate(ctx, s, args[1:])
+	case "check":
+		// Read-only: is the bucket private, and whose credentials are these?
+		c, err := s.readConfig()
+		if err != nil {
+			return err
+		}
+		if c.Remote == "" {
+			return fmt.Errorf("no remote set — run: shasync remote set <url>")
+		}
+		r, err := newRemote(ctx, c)
+		if err != nil {
+			return err
+		}
+		a, ok := r.(bucketAuditor)
+		if !ok {
+			return fmt.Errorf("can't check privacy settings for %s", c.Remote)
+		}
+		printBucketReport(a.auditBucket(ctx))
+		return nil
 	default:
 		return fmt.Errorf("unknown subcommand: remote %s", args[0])
 	}
@@ -1401,6 +1420,7 @@ func cmdPush(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	checkBucketBeforeSync(ctx, r)
 
 	// Implicit commit: snapshot the working tree if it's dirty. This is the
 	// step that makes "push" feel like "save everything to the cloud" — you

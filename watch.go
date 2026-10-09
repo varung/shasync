@@ -41,6 +41,7 @@ func cmdWatch(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	checkBucketBeforeSync(ctx, r)
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {

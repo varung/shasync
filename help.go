@@ -35,6 +35,7 @@ COMMANDS
   ls [<prefix>]                list objects in the remote bucket
   remote set <url>              configure remote (gs://... or s3://...)
   remote show                   print the configured remote
+  remote check                  is the bucket private? (also checked before push/watch)
   push [<sha>] [--force]        upload + update remote HEAD; auto-merges forks
   pull [<sha>]                  no arg: sync working tree to remote HEAD;
                                 with arg: download only (run checkout after)
