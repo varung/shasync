@@ -229,11 +229,26 @@ func (s *Store) ingestFile(src string) (string, int64, error) {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return "", 0, err
 	}
-	if err := cloneOrCopyFile(src, dst); err != nil {
+	// Build the object under a unique temp name and rename it into place:
+	// commit ingests in parallel, and two files with the same content would
+	// otherwise race on dst (one makes it read-only while the other's copy
+	// fallback opens it for writing — "permission denied").
+	tmp, err := os.CreateTemp(filepath.Dir(dst), ".tmp-*")
+	if err != nil {
+		return "", 0, err
+	}
+	tmpName := tmp.Name()
+	tmp.Close()
+	if err := cloneOrCopyFile(src, tmpName); err != nil {
+		os.Remove(tmpName)
 		return "", 0, err
 	}
 	// Objects are immutable — make them read-only to catch accidental writes.
-	_ = os.Chmod(dst, 0o444)
+	_ = os.Chmod(tmpName, 0o444)
+	if err := os.Rename(tmpName, dst); err != nil {
+		os.Remove(tmpName)
+		return "", 0, err
+	}
 	return sha, size, nil
 }
 

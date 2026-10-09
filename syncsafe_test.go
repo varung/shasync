@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -354,5 +355,40 @@ func TestBucketCheckQuietWhenPrivate(t *testing.T) {
 	out := captureStdout(t, func() { checkBucketBeforeSync(context.Background(), r) })
 	if strings.TrimSpace(out) != "bucket b: private ✓" {
 		t.Errorf("unexpected output: %q", out)
+	}
+}
+
+// Identical files ingested concurrently (commit uses parallel workers) must
+// not race on the shared object path.
+func TestIngestIdenticalFilesConcurrently(t *testing.T) {
+	dir := t.TempDir()
+	s := &Store{Root: dir}
+	content := bytes.Repeat([]byte("same picture "), 5000)
+	var paths []string
+	for i := 0; i < 16; i++ {
+		p := filepath.Join(dir, fmt.Sprintf("copy%d.png", i))
+		if err := os.WriteFile(p, content, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		paths = append(paths, p)
+	}
+	for round := 0; round < 20; round++ {
+		os.RemoveAll(filepath.Join(dir, ".blobs"))
+		var wg sync.WaitGroup
+		errs := make(chan error, len(paths))
+		for _, p := range paths {
+			wg.Add(1)
+			go func(p string) {
+				defer wg.Done()
+				if _, _, err := s.ingestFile(p); err != nil {
+					errs <- err
+				}
+			}(p)
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Fatalf("round %d: %v", round, err)
+		}
 	}
 }

@@ -180,12 +180,6 @@ also fully produce or consume them.
 ## 6. Data flow — commit
 
 ```
-(if a remote is configured, unless --offline or --force:)
-  → read remote HEAD
-  → fetch remote chain manifests (metadata, no blobs)
-  → if remote HEAD is ancestor of local HEAD (or equal, or empty): ok
-  → else refuse: "run shasync pull first"
-  → (network errors → warn and proceed; offline Just Works)
 walk working tree
   → for each file:
       if (path, size, mtime) matches parent manifest:
@@ -203,11 +197,10 @@ contents. The slow path (changed file) is a single SHA-256 pass plus
 an `ioctl(FICLONE)` — so `commit` on an unchanged 10 GB tree is
 milliseconds.
 
-The pre-flight network check is what makes the "always pull before
-commit" pattern automatic for a single user: forgetting to pull on
-machine B after a push from machine A fails fast instead of silently
-producing a divergent chain. `--offline` skips it; the fork is then
-resolved later in `push` (see §7).
+`commit` never touches the network. If machine B commits after A
+pushed, the chains diverge, and B's next `push` auto-merges the fork
+(see §7). (Earlier versions refused to commit when the remote was
+ahead; that check went away when push learned to merge.)
 
 ---
 

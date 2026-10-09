@@ -20,8 +20,8 @@ USAGE
 
 COMMANDS
   init                          initialize .blobs/ in the current directory
-  commit [-m <msg>] [--offline] snapshot the working tree, print manifest SHA
-                                (by default: refuses if remote HEAD is ahead)
+  commit [-m <msg>]             snapshot the working tree, print manifest SHA
+                                (local only; push merges any divergence)
   checkout <sha> [--force]      reflink files from manifest <sha> into the dir
   status                        show changes vs HEAD
   log [-n <count>] [--remote]   walk the manifest chain with dates + file diffs
@@ -461,10 +461,9 @@ blob store (S3 / GCS / rsync-over-SSH), and a thin command surface.
 COMMANDS
 
   init                        create .blobs/ in the current directory
-  commit [-m <msg>] [--offline|--force]
-                              snapshot the working tree; refuses by default if
-                              remote HEAD is ahead of local (--offline skips the
-                              network check; --force commits anyway)
+  commit [-m <msg>]           snapshot the working tree. Local only, no network:
+                              if the remote moved ahead meanwhile, push
+                              auto-merges the fork (see "help sync")
   checkout <sha> [--force]    materialise manifest <sha> into the working tree
   status                      show changes vs HEAD (path + size + mtime fast check)
   log [-n <count>] [--remote] walk the manifest chain with dates + file diffs;
