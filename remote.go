@@ -24,13 +24,15 @@ type Remote interface {
 }
 
 // Remote URL formats:
-//   gs://<bucket>/<prefix...>
-//   s3://<bucket>/<prefix...>
+//
+//	gs://<bucket>/<prefix...>
+//	s3://<bucket>/<prefix...>
 //
 // Optional env-var escape hatches used by tests:
-//   SHASYNC_S3_ENDPOINT      — custom S3 endpoint (e.g. http://localhost:9000)
-//   SHASYNC_S3_FORCE_PATH_STYLE=1
-//   STORAGE_EMULATOR_HOST  — standard GCS emulator env (e.g. http://localhost:8080)
+//
+//	SHASYNC_S3_ENDPOINT      — custom S3 endpoint (e.g. http://localhost:9000)
+//	SHASYNC_S3_FORCE_PATH_STYLE=1
+//	STORAGE_EMULATOR_HOST  — standard GCS emulator env (e.g. http://localhost:8080)
 func newRemote(ctx context.Context, c *Config) (Remote, error) {
 	url := c.Remote
 	switch {
@@ -90,6 +92,8 @@ func streamToFile(rc io.Reader, path string, mode os.FileMode) error {
 }
 
 // parallelFor runs fn on each item with N workers; returns the first error.
+// If ctx is canceled before every item was started, it returns ctx's error
+// rather than nil.
 func parallelFor[T any](ctx context.Context, workers int, items []T, fn func(context.Context, T) error) error {
 	if len(items) == 0 {
 		return nil
@@ -101,6 +105,7 @@ func parallelFor[T any](ctx context.Context, workers int, items []T, fn func(con
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var firstErr error
+	parent := ctx
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	for i := 0; i < workers; i++ {
@@ -120,15 +125,22 @@ func parallelFor[T any](ctx context.Context, workers int, items []T, fn func(con
 			}
 		}()
 	}
+	sent := 0
 outer:
 	for _, it := range items {
 		select {
 		case <-ctx.Done():
 			break outer
 		case ch <- it:
+			sent++
 		}
 	}
 	close(ch)
 	wg.Wait()
+	if firstErr == nil && sent < len(items) {
+		// Stopped early because the caller's context was canceled, not
+		// because fn failed: some items never ran, so this isn't success.
+		return parent.Err()
+	}
 	return firstErr
 }

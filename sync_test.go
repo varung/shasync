@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
+	"sync"
 	"testing"
 	"time"
 )
@@ -439,4 +442,47 @@ func mustTime(iso string) time.Time {
 		panic(err)
 	}
 	return t
+}
+
+// parallelFor must not report success when the caller's context is canceled
+// before every item was handed to a worker.
+func TestParallelForReportsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	items := make([]int, 1000)
+	var mu sync.Mutex
+	done := 0
+	err := parallelFor(ctx, 4, items, func(context.Context, int) error {
+		mu.Lock()
+		defer mu.Unlock()
+		done++
+		if done == 10 {
+			cancel()
+		}
+		return nil
+	})
+	if done < len(items) && err == nil {
+		t.Fatalf("processed %d of %d items, yet err == nil", done, len(items))
+	}
+	if err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+}
+
+// Many failing items (more than workers) still return promptly with the
+// first error.
+func TestParallelForManyErrors(t *testing.T) {
+	boom := errors.New("boom")
+	done := make(chan error, 1)
+	go func() {
+		done <- parallelFor(context.Background(), 4, make([]int, 100), func(context.Context, int) error { return boom })
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, boom) {
+			t.Fatalf("err = %v, want boom", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("parallelFor deadlocked")
+	}
 }
