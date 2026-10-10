@@ -506,3 +506,50 @@ func TestIngestFileChangedBetweenHashAndCopy(t *testing.T) {
 		t.Fatalf("objects = %v, want exactly one (no stray temp or mislabeled object)", objs)
 	}
 }
+
+// The push-log cache describes what the current remote already holds; after
+// `remote set` points the repo somewhere else it must be dropped, or push
+// skips blobs and manifests the new bucket has never seen.
+func TestRemoteSetClearsPushLogCacheWhenRemoteChanges(t *testing.T) {
+	m := newMachine(t, "m")
+	chdir(t, m.s.Root)
+	writeCache := func() {
+		t.Helper()
+		if err := m.s.writePushLogCache(&pushLogCache{Cursor: "x", Known: map[string]struct{}{"abc": {}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cacheExists := func() bool {
+		_, err := os.Stat(m.s.pushLogCachePath())
+		return err == nil
+	}
+	set := func(args ...string) {
+		t.Helper()
+		if err := cmdRemote(context.Background(), append([]string{"set"}, args...)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	writeCache()
+	set("s3://old-bucket/notes")
+	if cacheExists() {
+		t.Fatal("cache kept after setting a remote for the first time")
+	}
+
+	writeCache()
+	set("s3://old-bucket/notes")
+	if !cacheExists() {
+		t.Fatal("cache dropped although the remote did not change")
+	}
+
+	set("s3://new-bucket/notes")
+	if cacheExists() {
+		t.Fatal("cache kept after pointing at a new bucket")
+	}
+
+	writeCache()
+	set("--endpoint", "https://other.example", "s3://new-bucket/notes")
+	if cacheExists() {
+		t.Fatal("cache kept after changing the endpoint")
+	}
+}

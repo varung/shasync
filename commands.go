@@ -969,11 +969,24 @@ func cmdRemote(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
+		// A different URL, endpoint or profile (which may carry its own
+		// endpoint) can mean a different bucket.
+		changed := c.Remote != fs.Arg(0) || c.S3Endpoint != *endpoint || c.S3Profile != *profile
 		c.Remote = fs.Arg(0)
 		c.S3Profile = *profile
 		c.S3Endpoint = *endpoint
 		c.S3VirtualHostedStyle = *virtualHosted
-		return s.writeConfig(c)
+		if err := s.writeConfig(c); err != nil {
+			return err
+		}
+		if changed {
+			// The push-log cache lists what the *old* remote holds; keeping
+			// it would make push skip uploads the new remote needs.
+			if err := os.Remove(s.pushLogCachePath()); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("clear push-log cache: %w", err)
+			}
+		}
+		return nil
 	case "show":
 		c, err := s.readConfig()
 		if err != nil {
