@@ -108,9 +108,9 @@ type Config struct {
 	// the same OS-level hostname.
 	ClientID string `json:"client_id,omitempty"`
 
-	S3Endpoint          string `json:"s3_endpoint,omitempty"`
-	S3Profile           string `json:"s3_profile,omitempty"`
-	S3VirtualHostedStyle bool  `json:"s3_virtual_hosted_style,omitempty"`
+	S3Endpoint           string `json:"s3_endpoint,omitempty"`
+	S3Profile            string `json:"s3_profile,omitempty"`
+	S3VirtualHostedStyle bool   `json:"s3_virtual_hosted_style,omitempty"`
 }
 
 // newClientID returns 8 hex chars (32 bits of entropy) — enough for a
@@ -214,32 +214,59 @@ func (s *Store) pruneEmptyShardDirs() {
 	}
 }
 
-// ingestFile hashes src, moves/copies it into the object store at its SHA
-// (using reflink when possible so the working file and object share extents),
-// and returns the SHA. If the object already exists, the file is not duplicated.
+// ingestAfterHashHook, if set (tests only), runs between ingestFile's first
+// hash of src and its copy into the store.
+var ingestAfterHashHook func(src string)
+
+// ingestFile hashes src, copies it into the object store (using reflink when
+// possible so the working file and object share extents), and returns the
+// SHA and size of the bytes actually stored. If the object already exists,
+// the file is not duplicated.
+//
+// The copy is re-hashed before it is named: if src changed between the first
+// hash and the copy, the object is stored under the SHA of what was copied —
+// never under a stale SHA that other machines would then reject on download.
 func (s *Store) ingestFile(src string) (string, int64, error) {
 	sha, size, err := hashFile(src)
 	if err != nil {
 		return "", 0, err
 	}
-	dst := s.objectPath(sha)
-	if _, err := os.Stat(dst); err == nil {
+	if ingestAfterHashHook != nil {
+		ingestAfterHashHook(src)
+	}
+	if s.hasObject(sha) {
 		return sha, size, nil
 	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+	if err := os.MkdirAll(s.objectsPath(), 0o755); err != nil {
 		return "", 0, err
 	}
 	// Build the object under a unique temp name and rename it into place:
 	// commit ingests in parallel, and two files with the same content would
 	// otherwise race on dst (one makes it read-only while the other's copy
-	// fallback opens it for writing — "permission denied").
-	tmp, err := os.CreateTemp(filepath.Dir(dst), ".tmp-*")
+	// fallback opens it for writing — "permission denied"). The temp lives in
+	// objects/ itself, not a shard, because the final shard depends on the
+	// re-hash below.
+	tmp, err := os.CreateTemp(s.objectsPath(), ".tmp-*")
 	if err != nil {
 		return "", 0, err
 	}
 	tmpName := tmp.Name()
 	tmp.Close()
 	if err := cloneOrCopyFile(src, tmpName); err != nil {
+		os.Remove(tmpName)
+		return "", 0, err
+	}
+	sha, size, err = hashFile(tmpName)
+	if err != nil {
+		os.Remove(tmpName)
+		return "", 0, err
+	}
+	dst := s.objectPath(sha)
+	if s.hasObject(sha) {
+		os.Remove(tmpName)
+		return sha, size, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		os.Remove(tmpName)
 		return "", 0, err
 	}

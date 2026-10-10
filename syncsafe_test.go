@@ -466,3 +466,43 @@ func TestCommitWithUnreadableFilesErrorsWithoutHanging(t *testing.T) {
 		})
 	}
 }
+
+// A file that changes between ingestFile's hash and its copy into the store
+// must still be stored under the SHA of the bytes actually stored; otherwise
+// every other machine fails the SHA check downloading it, forever.
+func TestIngestFileChangedBetweenHashAndCopy(t *testing.T) {
+	dir := t.TempDir()
+	if err := initStore(dir); err != nil {
+		t.Fatal(err)
+	}
+	s := &Store{Root: dir}
+	p := filepath.Join(dir, "note.md")
+	if err := os.WriteFile(p, []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ingestAfterHashHook = func(string) {
+		if err := os.WriteFile(p, []byte("after, and longer"), 0o644); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { ingestAfterHashHook = nil })
+
+	sha, size, err := s.ingestFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, storedSize, err := hashFile(s.objectPath(sha))
+	if err != nil {
+		t.Fatalf("no object under returned sha %s: %v", shortSHA(sha), err)
+	}
+	if stored != sha || storedSize != size {
+		t.Fatalf("object %s holds bytes hashing to %s (size %d, returned %d)", shortSHA(sha), shortSHA(stored), storedSize, size)
+	}
+	if want, _, _ := hashBytesForTest("after, and longer"); sha != want {
+		t.Fatalf("sha = %s, want hash of the stored (new) content", shortSHA(sha))
+	}
+	objs, _ := s.listLocalObjects()
+	if len(objs) != 1 {
+		t.Fatalf("objects = %v, want exactly one (no stray temp or mislabeled object)", objs)
+	}
+}

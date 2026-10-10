@@ -185,7 +185,9 @@ walk working tree
       if (path, size, mtime) matches parent manifest:
         reuse parent's blob SHA (no hashing)
       else:
-        hash file → ingest into objects/<sha> (reflink or copy)
+        hash file → ingest into objects/<sha> (reflink or copy;
+        the copy is re-hashed, so a file edited mid-ingest is
+        stored and recorded under the SHA of the bytes stored)
   → build new manifest
   → canonicalize + sha256 it
   → write manifests/<sha>
