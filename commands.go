@@ -703,14 +703,7 @@ func cmdBrowse(ctx context.Context, args []string) error {
 	}
 
 	logCmd := exec.Command(self, "log", "--summary", "-n", fmt.Sprintf("%d", *n))
-	logOut, err := logCmd.StdoutPipe()
-	if err != nil {
-		return err
-	}
 	logCmd.Stderr = os.Stderr
-	if err := logCmd.Start(); err != nil {
-		return err
-	}
 
 	fzfCmd := exec.Command("fzf",
 		"--ansi",
@@ -718,11 +711,12 @@ func cmdBrowse(ctx context.Context, args []string) error {
 		"--preview-window=right:65%",
 		"--bind", "enter:execute("+enter+")",
 	)
-	fzfCmd.Stdin = logOut
 	fzfCmd.Stdout = os.Stdout
 	fzfCmd.Stderr = os.Stderr
-	runErr := fzfCmd.Run()
-	_ = logCmd.Wait() // log may have taken SIGPIPE when fzf closed its stdin; ignore.
+	runErr, err := runPiped(logCmd, fzfCmd)
+	if err != nil {
+		return err
+	}
 	if runErr != nil {
 		if ee, ok := runErr.(*exec.ExitError); ok {
 			// fzf exits 130 on esc/ctrl-c and 1 when no match is made — both are normal.
@@ -733,6 +727,25 @@ func cmdBrowse(ctx context.Context, args []string) error {
 		return runErr
 	}
 	return nil
+}
+
+// runPiped runs `src | dst` and returns dst's Run error (err is a failure to
+// start src). Once dst exits, our copy of the pipe's read end is closed so src
+// gets SIGPIPE/EPIPE instead of blocking forever on a full pipe that nobody
+// reads — e.g. when the user quits fzf before it has consumed all of the log.
+func runPiped(src, dst *exec.Cmd) (dstErr, err error) {
+	out, err := src.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	if err := src.Start(); err != nil {
+		return nil, err
+	}
+	dst.Stdin = out
+	dstErr = dst.Run()
+	out.Close()
+	_ = src.Wait() // src may have died of SIGPIPE when dst stopped reading; ignore.
+	return dstErr, nil
 }
 
 // shellSingleQuote wraps s in single quotes, escaping any embedded single

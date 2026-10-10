@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -484,5 +485,31 @@ func TestParallelForManyErrors(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("parallelFor deadlocked")
+	}
+}
+
+// `shasync browse` pipes the log into fzf. If fzf quits before reading all
+// of it, the log process must not be left blocked on a full pipe (which hung
+// browse on exit).
+func TestRunPipedReaderQuitsEarly(t *testing.T) {
+	if _, err := exec.LookPath("yes"); err != nil {
+		t.Skip("needs yes(1)")
+	}
+	done := make(chan error, 1)
+	go func() {
+		// `yes` writes forever; `true` exits without reading a byte.
+		dstErr, err := runPiped(exec.Command("yes"), exec.Command("true"))
+		if err == nil {
+			err = dstErr
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("runPiped hung after the reader exited")
 	}
 }
