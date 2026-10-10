@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // memRemote is an in-memory bucket. onBlobDownload runs once, at the first blob
@@ -417,5 +419,50 @@ func TestWatchSyncFreshEmptyCloneFastForwards(t *testing.T) {
 	}
 	if a.get("a.txt") != "alpha" || a.get("b.txt") != "bravo" {
 		t.Fatalf("files not checked out: a=%q b=%q", a.get("a.txt"), a.get("b.txt"))
+	}
+}
+
+// snapshotWithTimeout runs snapshotWorkingTree, failing the test if it hangs.
+func snapshotWithTimeout(t *testing.T, s *Store) error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := snapshotWorkingTree(s, "test")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(10 * time.Second):
+		t.Fatal("snapshotWorkingTree deadlocked")
+		return nil
+	}
+}
+
+// Unreadable files make commit fail (as one always did) — and many of them
+// (more than the worker count) must not deadlock it.
+func TestCommitWithUnreadableFilesErrorsWithoutHanging(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read chmod-000 files")
+	}
+	for _, n := range []int{1, 8, 50} {
+		t.Run(fmt.Sprint(n), func(t *testing.T) {
+			m := newMachine(t, "m")
+			m.put(t, "ok.txt", "fine")
+			for i := 0; i < n; i++ {
+				p := filepath.Join(m.s.Root, fmt.Sprintf("locked%02d.txt", i))
+				if err := os.WriteFile(p, []byte(fmt.Sprint(i)), 0o000); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { os.Chmod(p, 0o644) })
+			}
+			err := snapshotWithTimeout(t, m.s)
+			if err == nil || !errors.Is(err, os.ErrPermission) {
+				t.Fatalf("err = %v, want permission error", err)
+			}
+			if head, _ := m.s.readHead(); head != "" {
+				t.Fatalf("HEAD advanced to %s despite errors", head)
+			}
+		})
 	}
 }

@@ -72,53 +72,68 @@ func snapshotWorkingTree(s *Store, message string) (string, bool, error) {
 
 	files := make(map[string]*ManifestFile, len(paths))
 	var mu sync.Mutex
-	type job struct{ rel string }
-	jobs := make(chan job)
-	errs := make(chan error, 8)
+	// Workers never exit early: on an error they record it and keep draining
+	// jobs (skipping the work), so the sender below can never block on a
+	// channel nobody reads — however many files fail.
+	var firstErr error
+	fail := func(err error) {
+		mu.Lock()
+		if firstErr == nil {
+			firstErr = err
+		}
+		mu.Unlock()
+	}
+	failed := func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return firstErr != nil
+	}
+	jobs := make(chan string)
 	var wg sync.WaitGroup
 	workers := 8
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := range jobs {
-				abs := filepath.Join(s.Root, filepath.FromSlash(j.rel))
+			for rel := range jobs {
+				if failed() {
+					continue
+				}
+				abs := filepath.Join(s.Root, filepath.FromSlash(rel))
 				st, err := os.Stat(abs)
 				if err != nil {
-					errs <- err
-					return
+					fail(err)
+					continue
 				}
 				updatedAt := st.ModTime().UnixMilli()
 				mode := uint32(st.Mode().Perm())
 				// Fast path: unchanged from parent manifest.
-				if prev, ok := parentFiles[j.rel]; ok && prev.Size == st.Size() && prev.UpdatedAt == updatedAt {
+				if prev, ok := parentFiles[rel]; ok && prev.Size == st.Size() && prev.UpdatedAt == updatedAt {
 					if s.hasObject(prev.SHA) {
 						mu.Lock()
-						files[j.rel] = &ManifestFile{SHA: prev.SHA, Size: prev.Size, UpdatedAt: prev.UpdatedAt, Mode: prev.Mode}
+						files[rel] = &ManifestFile{SHA: prev.SHA, Size: prev.Size, UpdatedAt: prev.UpdatedAt, Mode: prev.Mode}
 						mu.Unlock()
 						continue
 					}
 				}
 				sha, size, err := s.ingestFile(abs)
 				if err != nil {
-					errs <- err
-					return
+					fail(err)
+					continue
 				}
 				mu.Lock()
-				files[j.rel] = &ManifestFile{SHA: sha, Size: size, UpdatedAt: updatedAt, Mode: mode}
+				files[rel] = &ManifestFile{SHA: sha, Size: size, UpdatedAt: updatedAt, Mode: mode}
 				mu.Unlock()
 			}
 		}()
 	}
 	for _, p := range paths {
-		jobs <- job{rel: p}
+		jobs <- p
 	}
 	close(jobs)
 	wg.Wait()
-	select {
-	case e := <-errs:
-		return "", false, e
-	default:
+	if firstErr != nil {
+		return "", false, firstErr
 	}
 
 	// No-op detection based on file contents, not full-manifest hash:
@@ -1827,12 +1842,12 @@ func fetchBlobsForChain(ctx context.Context, r Remote, s *Store, cryptKey []byte
 //     - remote is ancestor-of-local      → nothing to do, local is ahead
 //     - local is ancestor-of-remote      → fast-forward: fetch + checkout
 //     - otherwise (diverged)             → build a merge manifest whose
-//       parent is remote tip; files changed on only one side are taken
-//       verbatim; files changed differently on both sides keep the remote
-//       version at the original path and save the local version as a
-//       sibling "<stem> (modified on <date> by <clientID>)<ext>" file. The
-//       merge is checked out into the working tree. A subsequent
-//       `shasync push` becomes a plain fast-forward.
+//     parent is remote tip; files changed on only one side are taken
+//     verbatim; files changed differently on both sides keep the remote
+//     version at the original path and save the local version as a
+//     sibling "<stem> (modified on <date> by <clientID>)<ext>" file. The
+//     merge is checked out into the working tree. A subsequent
+//     `shasync push` becomes a plain fast-forward.
 //
 // cmdPull <sha>: download-only (legacy behavior). No implicit commit, no
 // merge, no working-tree mutation. Leaves local HEAD untouched so the
