@@ -392,3 +392,30 @@ func TestIngestIdenticalFilesConcurrently(t *testing.T) {
 		}
 	}
 }
+
+// A fresh, empty clone must fast-forward to the remote on its first watch
+// cycle, not treat the empty local HEAD as a fork ("no common ancestor").
+func TestWatchSyncFreshEmptyCloneFastForwards(t *testing.T) {
+	r := &memRemote{objs: map[string][]byte{}}
+	b := newMachine(t, "machineB")
+	b.put(t, "a.txt", "alpha")
+	b.put(t, "b.txt", "bravo")
+	b.sync(t, r)
+	remote, err := readRemoteHead(context.Background(), r)
+	if err != nil || remote == "" {
+		t.Fatalf("remote HEAD = %q, %v", remote, err)
+	}
+
+	a := newMachine(t, "machineA")
+	for i := 0; i < 2; i++ { // every cycle must succeed, not just the first
+		if err := syncOnce(context.Background(), a.s, r, testKey(t), a.c); err != nil {
+			t.Fatalf("cycle %d: %v", i, err)
+		}
+	}
+	if head, _ := a.s.readHead(); head != remote {
+		t.Fatalf("local HEAD = %q, want remote %q", head, remote)
+	}
+	if a.get("a.txt") != "alpha" || a.get("b.txt") != "bravo" {
+		t.Fatalf("files not checked out: a=%q b=%q", a.get("a.txt"), a.get("b.txt"))
+	}
+}

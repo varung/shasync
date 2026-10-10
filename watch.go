@@ -140,6 +140,10 @@ func syncOnce(ctx context.Context, s *Store, r Remote, cryptKey []byte, c *Confi
 	if local == "" {
 		local = sha
 	}
+	if local == "" {
+		// Fresh clone with nothing committed: there is no fork, just catch up.
+		return fetchAndCheckout(ctx, r, s, cryptKey, remote)
+	}
 
 	if local == remote {
 		if committed {
