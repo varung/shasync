@@ -211,9 +211,8 @@ impl Syncer {
     /// One full watch cycle (Go: `syncOnce`): commit, then fast-forward
     /// whichever side is behind, or merge a fork and push the merge.
     ///
-    /// Deliberate difference from Go: a fresh clone with no commits simply
-    /// fast-forwards to the remote (Go's `syncOnce` fails there with "no
-    /// common ancestor").
+    /// A fresh clone with no commits simply fast-forwards to the remote (as
+    /// Go's `syncOnce` does).
     pub async fn sync(&self) -> Result<SyncReport> {
         let c = self.commit_if_dirty().await?;
         let committed = c.committed.then(|| c.head.clone().unwrap());

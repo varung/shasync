@@ -70,12 +70,8 @@ mid-sync; nothing was lost, so retry", as in Go's watch loop.
 Known differences (none of them affect the format):
 
 - `load_key` reads only `.blobs/key`. It ignores `SHASYNC_KEY`.
-- `sync()` on a fresh clone with no commits fast-forwards; Go's
-  `syncOnce` fails there.
 - Names that aren't valid UTF-8 are skipped. Go would commit them under
   a U+FFFD-mangled name.
-- Ingest re-hashes the copied bytes, so a file edited mid-commit is
-  never stored under the wrong SHA.
 - S3 credentials are passed in explicitly. Nothing is read from
   `~/.aws`. There is no bucket-privacy check, and the region isn't
   auto-detected.
