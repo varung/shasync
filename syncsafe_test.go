@@ -643,3 +643,47 @@ func TestPushChecksWhatTheNewHeadNeeds(t *testing.T) {
 		t.Fatalf("clone got %q", got)
 	}
 }
+
+// An old version missing here and on the remote can't come back; syncing
+// must carry on rather than fail forever.
+func TestPushCarriesOnPastLostOldVersions(t *testing.T) {
+	m := newMachine(t, "m")
+	old := &memRemote{objs: map[string][]byte{}}
+	m.put(t, "note.md", "v1\n")
+	m.sync(t, old)
+	v1 := blobOf(t, m, "note.md")
+	m.put(t, "note.md", "v2, longer\n")
+	m.sync(t, old)
+	r := copyBucket(old, func(k string) bool { return !strings.HasPrefix(k, "push-log/") && k != remoteBlobKey(v1) })
+	r.objs["push-log/00000000000000000001-unrelated"] = []byte("\n")
+	if err := os.Remove(m.s.objectPath(v1)); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Remove(m.s.pushLogCachePath())
+	m.put(t, "note.md", "v3, longer still\n")
+	m.sync(t, r)
+	head, _ := m.s.readHead()
+	if got, _ := readRemoteHead(context.Background(), r); got != head {
+		t.Fatalf("remote HEAD %s, want %s", got, head)
+	}
+}
+
+// A current file whose stored copy is gone here and on the remote is read
+// again from the folder by the snapshot, so the push succeeds.
+func TestPushRestoresCurrentFilesFromTheFolder(t *testing.T) {
+	m := newMachine(t, "m")
+	old := &memRemote{objs: map[string][]byte{}}
+	m.put(t, "note.md", "v1\n")
+	m.sync(t, old)
+	blob := blobOf(t, m, "note.md")
+	if err := os.Remove(m.s.objectPath(blob)); err != nil {
+		t.Fatal(err)
+	}
+	r := copyBucket(old, func(k string) bool { return k != remoteBlobKey(blob) && k != remoteHeadKey })
+	m.sync(t, r)
+	b := newMachine(t, "b")
+	b.sync(t, r)
+	if got := b.get("note.md"); got != "v1\n" {
+		t.Fatalf("clone got %q", got)
+	}
+}

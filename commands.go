@@ -1740,7 +1740,9 @@ func ensureOnRemote(ctx context.Context, r Remote, s *Store, cryptKey []byte, ke
 			local = s.manifestPath(strings.TrimPrefix(key, "manifests/"))
 		}
 		if _, err := os.Stat(local); err != nil {
-			return fmt.Errorf("%s is needed by the new HEAD but is neither here nor on the remote", key)
+			// A blob of the new HEAD: the next snapshot re-reads it from
+			// the folder. (Chain manifests are always local.)
+			return errLocalEditsDuringSync
 		}
 		return uploadFile(ctx, r, cryptKey, local, key)
 	})
@@ -1801,6 +1803,12 @@ func uploadManifestChainAndSetHead(ctx context.Context, r Remote, s *Store, cryp
 		}
 	}
 	sort.Strings(novelBlobs)
+	tipBlobs := make(map[string]struct{}, len(m.Files))
+	for _, f := range m.Files {
+		tipBlobs[f.SHA] = struct{}{}
+	}
+	var lostMu sync.Mutex
+	var lost []string
 	if err := parallelFor(ctx, 16, novelBlobs, func(ctx context.Context, b string) error {
 		// The push-log doesn't list blobs uploaded before it existed, and gc
 		// deletes local copies of uploaded blobs: fine if the remote has it.
@@ -1812,11 +1820,28 @@ func uploadManifestChainAndSetHead(ctx context.Context, r Remote, s *Store, cryp
 			if ok {
 				return nil
 			}
-			return fmt.Errorf("blob %s is in this repo's history but neither here nor on the remote", b)
+			// Neither here nor on the remote. If the new HEAD uses it, the
+			// file changed (or its local copy was removed) after the
+			// snapshot; the next snapshot re-reads it from the folder. If
+			// only older snapshots use it, that old version is gone for
+			// good: say so and carry on rather than block every sync.
+			if _, ok := tipBlobs[b]; ok {
+				return errLocalEditsDuringSync
+			}
+			lostMu.Lock()
+			lost = append(lost, b)
+			lostMu.Unlock()
+			return nil
 		}
 		return uploadFile(ctx, r, cryptKey, s.objectPath(b), remoteBlobKey(b))
 	}); err != nil {
 		return err
+	}
+
+	if len(lost) > 0 {
+		sort.Strings(lost)
+		fmt.Fprintf(os.Stderr, "warning: %d old file version(s) are in neither this repo nor the remote and can't be restored: %s\n",
+			len(lost), strings.Join(lost, ", "))
 	}
 
 	// Filter manifests: only upload those not already on the remote.

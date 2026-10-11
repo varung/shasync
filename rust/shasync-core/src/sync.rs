@@ -113,6 +113,10 @@ pub struct SyncReport {
     /// The implicit commit made at the start, if the tree was dirty.
     pub committed: Option<String>,
     pub action: SyncAction,
+    /// Blobs only older snapshots use that are neither here nor on the
+    /// remote: those old versions can't be restored. Syncing carries on,
+    /// since nothing current needs them.
+    pub lost_history: Vec<String>,
 }
 
 // ----- Syncer --------------------------------------------------------------------------
@@ -127,13 +131,20 @@ pub struct Syncer {
     remote: Arc<dyn Remote>,
     key: Key,
     client_id: String,
+    lost_history: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl Syncer {
     /// Uses (and if needed, creates) the repo's client ID.
     pub fn new(repo: Repo, remote: Arc<dyn Remote>, key: Key) -> Result<Syncer> {
         let client_id = repo.ensure_client_id()?;
-        Ok(Syncer { repo, remote, key, client_id })
+        Ok(Syncer { repo, remote, key, client_id, lost_history: Default::default() })
+    }
+
+    fn take_lost_history(&self) -> Vec<String> {
+        let mut v = std::mem::take(&mut *self.lost_history.lock().unwrap());
+        v.sort();
+        v
     }
 
     pub fn repo(&self) -> &Repo {
@@ -160,7 +171,7 @@ impl Syncer {
     pub async fn pull(&self) -> Result<SyncReport> {
         let c = self.commit_if_dirty().await?;
         let committed = c.committed.then(|| c.head.clone().unwrap());
-        let report = |action| Ok(SyncReport { committed: committed.clone(), action });
+        let report = |action| Ok(SyncReport { committed: committed.clone(), action, lost_history: self.take_lost_history() });
         let Some(remote) = read_remote_head(self.remote()).await? else { return report(SyncAction::Nothing) };
         let local = self.repo.head_str()?;
         if local == remote {
@@ -186,7 +197,7 @@ impl Syncer {
     pub async fn push(&self) -> Result<SyncReport> {
         let c = self.commit_if_dirty().await?;
         let committed = c.committed.then(|| c.head.clone().unwrap());
-        let report = |action| Ok(SyncReport { committed: committed.clone(), action });
+        let report = |action| Ok(SyncReport { committed: committed.clone(), action, lost_history: self.take_lost_history() });
         let local = self.repo.head_str()?;
         if local.is_empty() {
             return report(SyncAction::Nothing);
@@ -216,7 +227,7 @@ impl Syncer {
     pub async fn sync(&self) -> Result<SyncReport> {
         let c = self.commit_if_dirty().await?;
         let committed = c.committed.then(|| c.head.clone().unwrap());
-        let report = |action| Ok(SyncReport { committed: committed.clone(), action });
+        let report = |action| Ok(SyncReport { committed: committed.clone(), action, lost_history: self.take_lost_history() });
         let Some(remote) = read_remote_head(self.remote()).await? else {
             return match c.head {
                 None => report(SyncAction::Nothing),
@@ -315,15 +326,29 @@ impl Syncer {
 
     /// Uploads one blob the push-log doesn't list. A blob missing here (`gc`
     /// deleted it) is fine if the remote has it: the push-log is only a hint.
-    async fn upload_blob(&self, sha: &str) -> Result<()> {
+    /// Missing on both sides, see [`Syncer::missing_everywhere`].
+    async fn upload_blob(&self, sha: &str, tip: &BTreeSet<String>) -> Result<()> {
         let key = remote_blob_key(sha);
-        if !self.repo.has_object(sha) {
-            if self.remote.exists(&key).await? {
-                return Ok(());
-            }
-            return Err(Error::Other(format!("blob {sha} is in this repo's history but neither here nor on the remote")));
+        if self.repo.has_object(sha) {
+            return self.upload_file(self.repo.object_path(sha), key).await;
         }
-        self.upload_file(self.repo.object_path(sha), key).await
+        if self.remote.exists(&key).await? {
+            return Ok(());
+        }
+        self.missing_everywhere(sha, tip)
+    }
+
+    /// A blob that's neither here nor on the remote. If the new HEAD uses
+    /// it, the file changed (or its copy was removed) after the snapshot:
+    /// the next cycle's snapshot re-reads it from the folder, so retry then.
+    /// If only older snapshots use it, that old version is gone for good;
+    /// note it and carry on rather than block every future sync.
+    fn missing_everywhere(&self, sha: &str, tip: &BTreeSet<String>) -> Result<()> {
+        if tip.contains(sha) {
+            return Err(Error::LocalEditsDuringSync);
+        }
+        self.lost_history.lock().unwrap().push(sha.to_string());
+        Ok(())
     }
 
     /// Go's `uploadFile`: read, zstd, encrypt (mandatory), upload.
@@ -394,7 +419,7 @@ impl Syncer {
         let (mut known, new_cursor) = self.fetch_known_remote_shas(&cache).await?;
 
         let novel_blobs: Vec<String> = blobs.into_iter().filter(|b| !known.contains(b)).collect();
-        stream::iter(novel_blobs.iter().map(|b| self.upload_blob(b)))
+        stream::iter(novel_blobs.iter().map(|b| self.upload_blob(b, &tip_blobs)))
             .buffer_unordered(WORKERS)
             .try_collect::<Vec<()>>()
             .await?;
@@ -406,7 +431,7 @@ impl Syncer {
 
         // What we skipped on the push-log's word and the old HEAD didn't need.
         let unchecked_blobs: Vec<String> =
-            tip_blobs.into_iter().filter(|b| known.contains(b) && !covered.contains(b)).collect();
+            tip_blobs.iter().filter(|b| known.contains(*b) && !covered.contains(*b)).cloned().collect();
         let unchecked_manifests: Vec<String> =
             chain.iter().filter(|m| known.contains(*m) && !covered.contains(*m)).cloned().collect();
         self.ensure_on_remote(&unchecked_blobs, &unchecked_manifests).await?;
@@ -449,9 +474,11 @@ impl Syncer {
         Ok(covered)
     }
 
-    /// Makes sure these objects are on the remote: checked one by one (or
-    /// with a listing when there are many), and uploaded from here if
-    /// missing. An object missing on both sides is an error.
+    /// Makes sure these objects (the new HEAD's blobs and manifest chain) are
+    /// on the remote: checked one by one (or with a listing when there are
+    /// many), and uploaded from here if missing. A blob missing on both sides
+    /// means retry after the next snapshot; manifests in the chain are always
+    /// local (the chain is walked from local manifests).
     async fn ensure_on_remote(&self, blobs: &[String], manifests: &[String]) -> Result<()> {
         let keys: Vec<(String, std::path::PathBuf)> = blobs
             .iter()
@@ -478,7 +505,7 @@ impl Syncer {
                 return Ok(());
             }
             if !local.exists() {
-                return Err(Error::Other(format!("{key} is needed by the new HEAD but is neither here nor on the remote")));
+                return Err(Error::LocalEditsDuringSync);
             }
             self.upload_file(local, key).await
         }))

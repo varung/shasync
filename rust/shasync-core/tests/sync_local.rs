@@ -325,7 +325,8 @@ async fn push_skips_gced_blobs_the_push_log_never_listed() {
     let rep = syncer.sync().await.unwrap();
     assert!(matches!(rep.action, SyncAction::Pushed { .. }), "{rep:?}");
 
-    // A blob gone from both sides is an error, not a silent skip.
+    // An old version gone from both sides can't come back; syncing goes on
+    // and reports it.
     let mem2 = MemoryRemote::new();
     for (k, v) in mem.objects() {
         if !k.starts_with("push-log/") && !k.ends_with(&v1) {
@@ -336,8 +337,35 @@ async fn push_skips_gced_blobs_the_push_log_never_listed() {
     let _ = fs::remove_file(root.join(".blobs/push-log-cache"));
     let syncer = Syncer::new(Repo::open_exact(&root).unwrap(), Arc::new(mem2), key()).unwrap();
     put(&root, "note.md", b"v4\n");
-    let err = syncer.sync().await.unwrap_err().to_string();
-    assert!(err.contains(&v1) && err.contains("neither here nor on the remote"), "{err}");
+    let rep = syncer.sync().await.unwrap();
+    assert!(matches!(rep.action, SyncAction::Pushed { .. }), "{rep:?}");
+    assert_eq!(rep.lost_history, vec![v1]);
+}
+
+/// A file the new HEAD uses whose stored copy is gone (here and on the
+/// remote): the snapshot re-reads it from the folder, so the push succeeds.
+#[tokio::test(flavor = "multi_thread")]
+async fn push_restores_current_files_from_the_folder() {
+    let mem = MemoryRemote::new();
+    let a = Machine::new(Arc::new(mem.clone()));
+    a.put("note.md", "v1\n");
+    a.sync().await;
+    let blob = a.syncer.repo().read_manifest(&a.syncer.repo().head().unwrap().unwrap()).unwrap().files["note.md"].sha.clone();
+    fs::remove_file(a.syncer.repo().object_path(&blob)).unwrap();
+    let bare = MemoryRemote::new();
+    for (k, v) in mem.objects() {
+        if k != format!("blobs/{blob}") && k != "HEAD" {
+            bare.insert_raw(&k, v);
+        }
+    }
+    let root = a.root().to_path_buf();
+    let syncer = Syncer::new(Repo::open_exact(&root).unwrap(), Arc::new(bare.clone()), key()).unwrap();
+    let rep = syncer.sync().await.unwrap();
+    assert!(matches!(rep.action, SyncAction::Pushed { .. }), "{rep:?}");
+    assert!(rep.lost_history.is_empty());
+    let b = Machine::new(Arc::new(bare));
+    b.sync().await;
+    assert_eq!(b.get("note.md").unwrap(), "v1\n");
 }
 
 /// A push-log that lists a blob the remote doesn't have (deleted by hand,
