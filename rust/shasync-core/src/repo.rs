@@ -687,8 +687,9 @@ impl Repo {
 
     // ----- push-log cache -------------------------------------------------------------------
 
-    /// `.blobs/clone-target`: the snapshot a first sync is downloading, so
-    /// an interrupted one resumes with the same snapshot.
+    /// `.blobs/clone-target`: the snapshot a first sync is downloading (first
+    /// line), so an interrupted one resumes with the same snapshot, then the
+    /// paths that already held something else when it began.
     pub(crate) fn clone_target_path(&self) -> PathBuf {
         self.blobs_dir().join(CLONE_TARGET_FILE)
     }
@@ -703,12 +704,26 @@ impl Repo {
         }
     }
 
-    /// Ends a first sync: every path of `target` gets target's content. A
-    /// different file already at a path (a note made before syncing, or
-    /// edited while files were arriving) is kept as a conflict copy next to
-    /// it, as a merge would. Files `target` doesn't have are left alone (the
-    /// next snapshot adds them). Then HEAD = `target`. Returns the copies.
-    pub(crate) fn finish_clone(&self, target: &str, client_id: &str, now_ms: i64) -> Result<Vec<String>> {
+    /// The paths of `target` that hold something else right now: at the start
+    /// of a first sync, the folder's own notes that clash with the remote's.
+    pub(crate) fn clashing_paths(&self, target: &str) -> Result<Vec<String>> {
+        let tm = self.read_manifest(target)?;
+        let mut out = Vec::new();
+        for (p, f) in &tm.files {
+            if fs::symlink_metadata(self.abs(p)).is_ok() && !self.disk_matches(p, Some(f))? {
+                out.push(p.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Ends a first sync: every path of `target` gets target's content,
+    /// except files edited since the sync placed them, which stay as edits
+    /// on top. A path in `clashing` (something else was there before the
+    /// sync began) keeps that file as a conflict copy next to it, as a merge
+    /// would. Files `target` doesn't have are left alone (the next snapshot
+    /// adds them). Then HEAD = `target`. Returns the copies.
+    pub(crate) fn finish_clone(&self, target: &str, clashing: &HashSet<String>, client_id: &str, now_ms: i64) -> Result<Vec<String>> {
         let tm = self.read_manifest(target)?;
         let stamp = crate::merge::conflict_stamp(now_ms)?;
         let mut copies = Vec::new();
@@ -721,6 +736,9 @@ impl Repo {
             }
             let abs = self.abs(p);
             if let Ok(st) = fs::symlink_metadata(&abs) {
+                if !clashing.contains(p) && !st.is_dir() {
+                    continue; // placed by this sync, then edited: an edit on top of target
+                }
                 if st.is_dir() {
                     return Err(Error::Other(format!("{p} is a folder here but a file in the snapshot being downloaded")));
                 }

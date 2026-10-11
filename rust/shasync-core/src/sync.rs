@@ -328,14 +328,31 @@ impl Syncer {
             return Ok(None);
         }
         let marker = self.repo.clone_target_path();
-        let target = match fs::read_to_string(&marker) {
-            Ok(s) if s.trim().len() == 64 => s.trim().to_string(),
-            _ => match read_remote_head(self.remote()).await? {
-                Some(h) => h,
-                None => return Ok(None),
-            },
+        let resumed = fs::read_to_string(&marker).ok().and_then(|s| {
+            let mut lines = s.lines();
+            let target = lines.next()?.trim().to_string();
+            (target.len() == 64).then(|| (target, lines.map(str::to_string).collect::<HashSet<String>>()))
+        });
+        let (target, clashing) = match resumed {
+            Some(r) => r,
+            None => {
+                let Some(target) = read_remote_head(self.remote()).await? else { return Ok(None) };
+                if !self.repo.has_manifest(&target) {
+                    self.download_manifest(&target).await?;
+                }
+                // Nothing placed yet: whatever is at the snapshot's paths was
+                // here before. Only those can become conflict copies.
+                let t = target.clone();
+                let clashing: HashSet<String> = self.blocking(move |r| r.clashing_paths(&t)).await?.into_iter().collect();
+                let mut text = format!("{target}\n");
+                for p in &clashing {
+                    text.push_str(p);
+                    text.push('\n');
+                }
+                write_file_atomic(&marker, text.as_bytes(), 0o644)?;
+                (target, clashing)
+            }
         };
-        write_file_atomic(&marker, format!("{target}\n").as_bytes(), 0o644)?;
         if !self.repo.has_manifest(&target) {
             self.download_manifest(&target).await?;
         }
@@ -362,7 +379,7 @@ impl Syncer {
         }
         self.download_blobs_placing(need, Some(&place)).await?;
         let (t, id) = (target.clone(), self.client_id.clone());
-        let copies = self.blocking(move |r| r.finish_clone(&t, &id, now_unix_ms())).await?;
+        let copies = self.blocking(move |r| r.finish_clone(&t, &clashing, &id, now_unix_ms())).await?;
         Ok(Some((target, copies)))
     }
 

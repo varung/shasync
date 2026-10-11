@@ -497,3 +497,28 @@ fn walk_count(dir: &Path) -> usize {
         .map(|rd| rd.map(|e| e.unwrap()).map(|e| if e.path().is_dir() { walk_count(&e.path()) } else { 1 }).sum())
         .unwrap_or(0)
 }
+
+/// A note edited while a first sync was still downloading (it had been
+/// placed, then changed) stays as an edit on top, not a conflict copy.
+#[tokio::test(flavor = "multi_thread")]
+async fn edits_made_during_a_first_sync_stay_in_the_note() {
+    let mem: Arc<dyn Remote> = Arc::new(MemoryRemote::new());
+    let a = Machine::new(mem.clone());
+    a.put("plan.md", "plan\n");
+    a.put("big.pdf", "pdf\n");
+    a.sync().await;
+    let target = a.syncer.repo().head().unwrap().unwrap();
+
+    let b = Machine::new(mem.clone());
+    // As if the first sync had placed plan.md, the user edited it, and the
+    // sync was then interrupted; nothing clashed when it began.
+    fs::write(b.root().join(".blobs/clone-target"), format!("{target}\n")).unwrap();
+    b.put("plan.md", "plan\nplus a line typed on the phone\n");
+    let rep = b.syncer.sync().await.unwrap();
+    assert!(rep.clone_conflicts.is_empty(), "{rep:?}");
+    assert_eq!(b.get("plan.md").unwrap(), "plan\nplus a line typed on the phone\n");
+    assert!(b.conflict_copies("plan").is_empty());
+
+    a.sync().await;
+    assert_eq!(a.get("plan.md").unwrap(), "plan\nplus a line typed on the phone\n");
+}
