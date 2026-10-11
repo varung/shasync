@@ -398,3 +398,102 @@ async fn push_never_trusts_the_push_log_for_what_head_needs() {
     assert!(matches!(b.sync().await, Some(SyncAction::FastForwarded { .. })));
     assert_eq!(b.get("note.md").unwrap(), "v1\n");
 }
+
+/// A folder's first sync when it already has notes: no "unrelated
+/// histories". The remote's snapshot comes down, a clashing note is kept as
+/// a conflict copy, and the folder's own notes are added on top and pushed.
+#[tokio::test(flavor = "multi_thread")]
+async fn first_sync_keeps_notes_already_in_the_folder() {
+    let mem: Arc<dyn Remote> = Arc::new(MemoryRemote::new());
+    let a = Machine::new(mem.clone());
+    a.put("note.md", "from the bucket\n");
+    a.put("shared.md", "same\n");
+    a.sync().await;
+
+    let b = Machine::new(mem.clone());
+    b.put("note.md", "made on the phone first\n");
+    b.put("shared.md", "same\n");
+    b.put("phone-only.md", "phone\n");
+    let rep = b.syncer.sync().await.unwrap();
+    assert!(rep.cloned.is_some());
+    assert_eq!(rep.clone_conflicts.len(), 1, "{rep:?}");
+    assert_eq!(b.get("note.md").unwrap(), "from the bucket\n");
+    assert_eq!(b.get(&rep.clone_conflicts[0]).unwrap(), "made on the phone first\n");
+    assert!(matches!(rep.action, SyncAction::Pushed { .. }), "{rep:?}");
+
+    a.sync().await;
+    assert_eq!(a.get("phone-only.md").unwrap(), "phone\n");
+    assert_eq!(a.get(&rep.clone_conflicts[0]).unwrap(), "made on the phone first\n");
+    assert_eq!(a.get("note.md").unwrap(), "from the bucket\n");
+}
+
+/// A first sync downloads the newest snapshot only (one manifest, not the
+/// history), smallest files first, and reports progress; later syncs fetch
+/// just the new snapshots.
+#[tokio::test(flavor = "multi_thread")]
+async fn first_sync_starts_from_the_newest_snapshot() {
+    let mem: Arc<dyn Remote> = Arc::new(MemoryRemote::new());
+    let a = Machine::new(mem.clone());
+    for i in 0..3 {
+        a.put("note.md", &format!("version {i}\n"));
+        a.put("big.pdf", &"x".repeat(5000 + i));
+        a.sync().await;
+    }
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let ev = events.clone();
+    let dir = tempfile::tempdir().unwrap();
+    let syncer = Syncer::new(Repo::init(dir.path()).unwrap(), mem.clone(), key())
+        .unwrap()
+        .with_progress(Arc::new(move |p| ev.lock().unwrap().push(p)));
+    syncer.sync().await.unwrap();
+    assert_eq!(get(dir.path(), "note.md").unwrap(), "version 2\n");
+    let manifests = |root: &Path| walk_count(&root.join(".blobs/manifests"));
+    assert_eq!(manifests(dir.path()), 1, "a first sync should fetch only the newest manifest");
+
+    let ev = events.lock().unwrap().clone();
+    assert_eq!(ev[0], shasync_core::Progress::Listed { files: 2, bytes: 10 + 5002 });
+    let last = ev.iter().rev().find_map(|p| match p {
+        shasync_core::Progress::Downloading { done, total, bytes_done, bytes_total } => Some((*done, *total, *bytes_done, *bytes_total)),
+        _ => None,
+    });
+    assert_eq!(last, Some((2, 2, 5012, 5012)));
+    // Downloads start smallest first; with parallel workers they may finish in any order.
+
+    a.put("note.md", "version 3\n");
+    a.sync().await;
+    syncer.sync().await.unwrap();
+    assert_eq!(get(dir.path(), "note.md").unwrap(), "version 3\n");
+    assert_eq!(manifests(dir.path()), 2);
+}
+
+/// An interrupted first sync resumes with the same snapshot, keeping the
+/// files it already placed (no conflict copies of its own files).
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupted_first_sync_resumes() {
+    let mem: Arc<dyn Remote> = Arc::new(MemoryRemote::new());
+    let a = Machine::new(mem.clone());
+    a.put("one.md", "1\n");
+    a.put("two.md", "2\n");
+    a.sync().await;
+    let target = a.syncer.repo().head().unwrap().unwrap();
+
+    let b = Machine::new(mem.clone());
+    // As if a first sync had placed one.md and then stopped.
+    fs::write(b.root().join(".blobs/clone-target"), format!("{target}\n")).unwrap();
+    b.put("one.md", "1\n");
+    a.put("two.md", "2, changed after the first sync began\n");
+    a.sync().await;
+
+    let rep = b.syncer.sync().await.unwrap();
+    assert_eq!(rep.cloned.as_deref(), Some(target.as_str()), "resumes with the snapshot it started");
+    assert!(rep.clone_conflicts.is_empty(), "{rep:?}");
+    // ...then catches up to the newer one in the same sync.
+    assert_eq!(b.get("two.md").unwrap(), "2, changed after the first sync began\n");
+    assert!(!b.root().join(".blobs/clone-target").exists());
+}
+
+fn walk_count(dir: &Path) -> usize {
+    fs::read_dir(dir)
+        .map(|rd| rd.map(|e| e.unwrap()).map(|e| if e.path().is_dir() { walk_count(&e.path()) } else { 1 }).sum())
+        .unwrap_or(0)
+}

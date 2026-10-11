@@ -29,12 +29,7 @@ pub fn auto_merge(
     let anc = repo.read_manifest(anc_sha)?;
     let rem = repo.read_manifest(remote_sha)?;
     let loc = repo.read_manifest(local_sha)?;
-    let stamp = Local
-        .timestamp_millis_opt(now_ms)
-        .single()
-        .ok_or_else(|| Error::Other("bad merge time".into()))?
-        .format("%Y-%m-%d %H%M%S")
-        .to_string();
+    let stamp = conflict_stamp(now_ms)?;
 
     let paths: BTreeSet<&String> = anc.files.keys().chain(rem.files.keys()).chain(loc.files.keys()).collect();
     let mut out: BTreeMap<String, ManifestFile> = BTreeMap::new();
@@ -67,6 +62,16 @@ pub fn auto_merge(
         msg = format!("{msg} ({} conflict{suf})", conflicts.len());
     }
     Ok((Manifest::new(remote_sha, now_ms, msg, out), conflicts))
+}
+
+/// The `<stamp>` of conflict copies made at `now_ms` (unix ms), local time.
+pub(crate) fn conflict_stamp(now_ms: i64) -> Result<String> {
+    Ok(Local
+        .timestamp_millis_opt(now_ms)
+        .single()
+        .ok_or_else(|| Error::Other("bad merge time".into()))?
+        .format("%Y-%m-%d %H%M%S")
+        .to_string())
 }
 
 /// `"notes/todo.md"` → `"notes/todo (modified on <stamp> by <client>).md"`.

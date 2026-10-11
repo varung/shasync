@@ -27,6 +27,7 @@ const HEAD_FILE: &str = "HEAD";
 const CONFIG_FILE: &str = "config.json";
 const KEY_FILE: &str = "key";
 const PUSH_LOG_CACHE_FILE: &str = "push-log-cache";
+const CLONE_TARGET_FILE: &str = "clone-target";
 
 /// `.blobs/config.json`. Unknown fields are ignored on read (as in Go).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -685,6 +686,59 @@ impl Repo {
     }
 
     // ----- push-log cache -------------------------------------------------------------------
+
+    /// `.blobs/clone-target`: the snapshot a first sync is downloading, so
+    /// an interrupted one resumes with the same snapshot.
+    pub(crate) fn clone_target_path(&self) -> PathBuf {
+        self.blobs_dir().join(CLONE_TARGET_FILE)
+    }
+
+    /// During a first sync: writes `f` to `rel` if nothing is there yet, so
+    /// files appear as they download. Anything already there is left for
+    /// [`Repo::finish_clone`].
+    pub(crate) fn place_if_absent(&self, rel: &str, f: &ManifestFile) -> Result<()> {
+        match fs::symlink_metadata(self.abs(rel)) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => self.materialize(rel, f),
+            _ => Ok(()),
+        }
+    }
+
+    /// Ends a first sync: every path of `target` gets target's content. A
+    /// different file already at a path (a note made before syncing, or
+    /// edited while files were arriving) is kept as a conflict copy next to
+    /// it, as a merge would. Files `target` doesn't have are left alone (the
+    /// next snapshot adds them). Then HEAD = `target`. Returns the copies.
+    pub(crate) fn finish_clone(&self, target: &str, client_id: &str, now_ms: i64) -> Result<Vec<String>> {
+        let tm = self.read_manifest(target)?;
+        let stamp = crate::merge::conflict_stamp(now_ms)?;
+        let mut copies = Vec::new();
+        for (p, f) in &tm.files {
+            if self.disk_matches(p, Some(f))? {
+                continue;
+            }
+            if !self.has_object(&f.sha) {
+                return Err(Error::Other(format!("blob {} missing locally for {p}", short_sha(&f.sha))));
+            }
+            let abs = self.abs(p);
+            if let Ok(st) = fs::symlink_metadata(&abs) {
+                if st.is_dir() {
+                    return Err(Error::Other(format!("{p} is a folder here but a file in the snapshot being downloaded")));
+                }
+                let mut copy = crate::merge::conflict_copy_path(p, client_id, &stamp);
+                let mut n = 2;
+                while self.abs(&copy).exists() {
+                    copy = crate::merge::conflict_copy_path(p, client_id, &format!("{stamp} {n}"));
+                    n += 1;
+                }
+                fs::rename(&abs, self.abs(&copy))?;
+                copies.push(copy);
+            }
+            self.materialize(p, f)?;
+        }
+        self.write_head(target)?;
+        let _ = fs::remove_file(self.clone_target_path());
+        Ok(copies)
+    }
 
     pub(crate) fn push_log_cache_path(&self) -> PathBuf {
         self.blobs_dir().join(PUSH_LOG_CACHE_FILE)

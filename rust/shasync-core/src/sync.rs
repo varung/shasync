@@ -3,8 +3,9 @@
 //! `watch.go` (`syncOnce`, `fetchAndCheckout`) and the transfer half of
 //! `commands.go` (`uploadManifestChainAndSetHead`, `doMerge`, …).
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -13,7 +14,8 @@ use crate::crypto::{decode_object, encode_object, is_encrypted, Key, SALT_LENGTH
 use crate::error::{Error, Result};
 use crate::merge::auto_merge;
 use crate::remote::{remote_blob_key, remote_manifest_key, Remote, PUSH_LOG_PREFIX, REMOTE_HEAD_KEY, REMOTE_SALT_KEY};
-use crate::repo::{now_unix_ms, CommitResult, Repo};
+use crate::manifest::ManifestFile;
+use crate::repo::{now_unix_ms, write_file_atomic, CommitResult, Repo};
 
 /// Parallel transfers, as in Go.
 const WORKERS: usize = 16;
@@ -117,7 +119,24 @@ pub struct SyncReport {
     /// remote: those old versions can't be restored. Syncing carries on,
     /// since nothing current needs them.
     pub lost_history: Vec<String>,
+    /// Set when this was the folder's first sync: the remote snapshot it
+    /// started from (see [`Syncer::sync`]), and the conflict copies made for
+    /// files that were already in the folder.
+    pub cloned: Option<String>,
+    pub clone_conflicts: Vec<String>,
 }
+
+/// What a sync is doing, for a progress display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Progress {
+    /// The snapshot being downloaded holds this many files and bytes.
+    Listed { files: usize, bytes: u64 },
+    /// Downloading the files a snapshot needs, smallest first.
+    Downloading { done: usize, total: usize, bytes_done: u64, bytes_total: u64 },
+    Uploading { done: usize, total: usize },
+}
+
+pub type ProgressFn = Arc<dyn Fn(Progress) + Send + Sync>;
 
 // ----- Syncer --------------------------------------------------------------------------
 
@@ -132,13 +151,26 @@ pub struct Syncer {
     key: Key,
     client_id: String,
     lost_history: Arc<std::sync::Mutex<Vec<String>>>,
+    progress: Option<ProgressFn>,
 }
 
 impl Syncer {
     /// Uses (and if needed, creates) the repo's client ID.
     pub fn new(repo: Repo, remote: Arc<dyn Remote>, key: Key) -> Result<Syncer> {
         let client_id = repo.ensure_client_id()?;
-        Ok(Syncer { repo, remote, key, client_id, lost_history: Default::default() })
+        Ok(Syncer { repo, remote, key, client_id, lost_history: Default::default(), progress: None })
+    }
+
+    /// Calls `f` as the sync makes progress (from the sync's own threads).
+    pub fn with_progress(mut self, f: ProgressFn) -> Syncer {
+        self.progress = Some(f);
+        self
+    }
+
+    fn report_progress(&self, p: Progress) {
+        if let Some(f) = &self.progress {
+            f(p);
+        }
     }
 
     fn take_lost_history(&self) -> Vec<String> {
@@ -171,7 +203,7 @@ impl Syncer {
     pub async fn pull(&self) -> Result<SyncReport> {
         let c = self.commit_if_dirty().await?;
         let committed = c.committed.then(|| c.head.clone().unwrap());
-        let report = |action| Ok(SyncReport { committed: committed.clone(), action, lost_history: self.take_lost_history() });
+        let report = |action| Ok(SyncReport { committed: committed.clone(), action, lost_history: self.take_lost_history(), cloned: None, clone_conflicts: Vec::new() });
         let Some(remote) = read_remote_head(self.remote()).await? else { return report(SyncAction::Nothing) };
         let local = self.repo.head_str()?;
         if local == remote {
@@ -197,7 +229,7 @@ impl Syncer {
     pub async fn push(&self) -> Result<SyncReport> {
         let c = self.commit_if_dirty().await?;
         let committed = c.committed.then(|| c.head.clone().unwrap());
-        let report = |action| Ok(SyncReport { committed: committed.clone(), action, lost_history: self.take_lost_history() });
+        let report = |action| Ok(SyncReport { committed: committed.clone(), action, lost_history: self.take_lost_history(), cloned: None, clone_conflicts: Vec::new() });
         let local = self.repo.head_str()?;
         if local.is_empty() {
             return report(SyncAction::Nothing);
@@ -224,10 +256,28 @@ impl Syncer {
     ///
     /// A fresh clone with no commits simply fast-forwards to the remote (as
     /// Go's `syncOnce` does).
+    ///
+    /// A folder's first sync (no local snapshot yet) starts from the
+    /// remote's newest snapshot instead: just that manifest, not the history;
+    /// its files downloaded smallest first and placed as they arrive; files
+    /// already in the folder kept (as conflict copies if a path clashes) and
+    /// snapshotted on top. Interrupted, it resumes with the same snapshot.
     pub async fn sync(&self) -> Result<SyncReport> {
+        let (cloned, clone_conflicts) = match self.clone_if_new().await? {
+            Some((sha, copies)) => (Some(sha), copies),
+            None => (None, Vec::new()),
+        };
         let c = self.commit_if_dirty().await?;
         let committed = c.committed.then(|| c.head.clone().unwrap());
-        let report = |action| Ok(SyncReport { committed: committed.clone(), action, lost_history: self.take_lost_history() });
+        let report = |action| {
+            Ok(SyncReport {
+                committed: committed.clone(),
+                action,
+                lost_history: self.take_lost_history(),
+                cloned: cloned.clone(),
+                clone_conflicts: clone_conflicts.clone(),
+            })
+        };
         let Some(remote) = read_remote_head(self.remote()).await? else {
             return match c.head {
                 None => report(SyncAction::Nothing),
@@ -236,6 +286,9 @@ impl Syncer {
         };
         let local = self.repo.head_str()?;
         if local == remote {
+            if cloned.is_some() {
+                return report(SyncAction::FastForwarded { to: remote });
+            }
             return report(SyncAction::UpToDate { head: local });
         }
         self.fetch_manifest_chain(&remote).await?;
@@ -254,17 +307,63 @@ impl Syncer {
 
     // ----- building blocks -----------------------------------------------------------
 
-    /// Downloads manifest `tip` and its ancestors that aren't local (Go:
-    /// `fetchManifestChain`). Doesn't touch the working tree or HEAD.
+    /// Downloads manifest `tip` and its ancestors back to the first one
+    /// that's already local (Go: `fetchManifestChain`). A local manifest's
+    /// history is local too, except before the snapshot a first sync started
+    /// from, which is never needed. Doesn't touch the working tree or HEAD.
     pub async fn fetch_manifest_chain(&self, tip: &str) -> Result<()> {
         let mut cur = tip.to_string();
-        while !cur.is_empty() {
-            if !self.repo.has_manifest(&cur) {
-                self.download_manifest(&cur).await?;
-            }
+        while !cur.is_empty() && !self.repo.has_manifest(&cur) {
+            self.download_manifest(&cur).await?;
             cur = self.repo.read_manifest(&cur)?.parent_sha;
         }
         Ok(())
+    }
+
+    /// A first sync (see [`Syncer::sync`]): returns the snapshot it started
+    /// from and the conflict copies it made, or `None` if the folder already
+    /// has a snapshot or the remote has none.
+    async fn clone_if_new(&self) -> Result<Option<(String, Vec<String>)>> {
+        if self.repo.head()?.is_some() {
+            return Ok(None);
+        }
+        let marker = self.repo.clone_target_path();
+        let target = match fs::read_to_string(&marker) {
+            Ok(s) if s.trim().len() == 64 => s.trim().to_string(),
+            _ => match read_remote_head(self.remote()).await? {
+                Some(h) => h,
+                None => return Ok(None),
+            },
+        };
+        write_file_atomic(&marker, format!("{target}\n").as_bytes(), 0o644)?;
+        if !self.repo.has_manifest(&target) {
+            self.download_manifest(&target).await?;
+        }
+        let m = self.repo.read_manifest(&target)?;
+        self.report_progress(Progress::Listed { files: m.files.len(), bytes: m.files.values().map(|f| f.size.max(0) as u64).sum() });
+
+        let mut by_blob: HashMap<String, Vec<(String, ManifestFile)>> = HashMap::new();
+        for (p, f) in &m.files {
+            by_blob.entry(f.sha.clone()).or_default().push((p.clone(), f.clone()));
+        }
+        let place = |sha: &str| -> Result<()> {
+            for (p, f) in by_blob.get(sha).into_iter().flatten() {
+                self.repo.place_if_absent(p, f)?;
+            }
+            Ok(())
+        };
+        let mut need = Vec::new();
+        for (sha, uses) in &by_blob {
+            if self.repo.has_object(sha) {
+                place(sha)?; // a resumed first sync
+            } else {
+                need.push((sha.clone(), uses[0].1.size.max(0) as u64));
+            }
+        }
+        self.download_blobs_placing(need, Some(&place)).await?;
+        let (t, id) = (target.clone(), self.client_id.clone());
+        let copies = self.blocking(move |r| r.finish_clone(&t, &id, now_unix_ms())).await?;
+        Ok(Some((target, copies)))
     }
 
     /// Downloads every blob `manifest_sha` references that isn't local.
@@ -274,9 +373,9 @@ impl Syncer {
             self.download_manifest(manifest_sha).await?;
         }
         let m = self.repo.read_manifest(manifest_sha)?;
-        let need: BTreeSet<String> =
-            m.files.values().filter(|f| !self.repo.has_object(&f.sha)).map(|f| f.sha.clone()).collect();
-        self.download_blobs(need).await
+        let need: HashMap<String, u64> =
+            m.files.values().filter(|f| !self.repo.has_object(&f.sha)).map(|f| (f.sha.clone(), f.size.max(0) as u64)).collect();
+        self.download_blobs(need.into_iter().collect()).await
     }
 
     /// Go's `fetchAndCheckout`: download `target`'s blobs, then move the
@@ -292,17 +391,37 @@ impl Syncer {
         .await
     }
 
-    async fn download_blobs(&self, shas: impl IntoIterator<Item = String>) -> Result<usize> {
-        let shas: Vec<String> = shas.into_iter().collect();
-        let n = shas.len();
-        stream::iter(shas.into_iter().map(|sha| async move {
+    /// Downloads these blobs (sha, size), smallest first, reporting progress.
+    async fn download_blobs(&self, blobs: Vec<(String, u64)>) -> Result<usize> {
+        self.download_blobs_placing(blobs, None).await
+    }
+
+    /// [`Syncer::download_blobs`], calling `placed` with each blob's SHA once
+    /// it's stored.
+    async fn download_blobs_placing(&self, mut blobs: Vec<(String, u64)>, placed: Option<&(dyn Fn(&str) -> Result<()> + Sync)>) -> Result<usize> {
+        blobs.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        let (total, bytes_total) = (blobs.len(), blobs.iter().map(|b| b.1).sum::<u64>());
+        if total == 0 {
+            return Ok(0);
+        }
+        let (done, bytes_done) = (AtomicUsize::new(0), AtomicU64::new(0));
+        self.report_progress(Progress::Downloading { done: 0, total, bytes_done: 0, bytes_total });
+        let (done, bytes_done) = (&done, &bytes_done);
+        stream::iter(blobs.into_iter().map(|(sha, size)| async move {
             let dst = self.repo.object_path(&sha);
-            self.download_to(&remote_blob_key(&sha), dst, sha).await
+            self.download_to(&remote_blob_key(&sha), dst, sha.clone()).await?;
+            if let Some(placed) = placed {
+                placed(&sha)?;
+            }
+            let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+            let b = bytes_done.fetch_add(size, Ordering::Relaxed) + size;
+            self.report_progress(Progress::Downloading { done: d, total, bytes_done: b, bytes_total });
+            Ok::<(), Error>(())
         }))
         .buffer_unordered(WORKERS)
         .try_collect::<Vec<()>>()
         .await?;
-        Ok(n)
+        Ok(total)
     }
 
     async fn download_manifest(&self, sha: &str) -> Result<()> {
@@ -380,14 +499,14 @@ impl Syncer {
             remote: crate::repo::short_sha(remote).to_string(),
         })?;
         // Blobs referenced on the remote side since the ancestor.
-        let mut need = BTreeSet::new();
+        let mut need = HashMap::new();
         let mut cur = remote.to_string();
         while !cur.is_empty() && cur != anc {
             let m = self.repo.read_manifest(&cur)?;
-            need.extend(m.files.values().filter(|f| !self.repo.has_object(&f.sha)).map(|f| f.sha.clone()));
+            need.extend(m.files.values().filter(|f| !self.repo.has_object(&f.sha)).map(|f| (f.sha.clone(), f.size.max(0) as u64)));
             cur = m.parent_sha;
         }
-        self.download_blobs(need).await?;
+        self.download_blobs(need.into_iter().collect()).await?;
         let (m, conflicts) = auto_merge(&self.repo, &self.client_id, now_unix_ms(), &anc, remote, local)?;
         let sha = self.repo.write_manifest(&m)?;
         Ok((sha, conflicts))
@@ -419,7 +538,17 @@ impl Syncer {
         let (mut known, new_cursor) = self.fetch_known_remote_shas(&cache).await?;
 
         let novel_blobs: Vec<String> = blobs.into_iter().filter(|b| !known.contains(b)).collect();
-        stream::iter(novel_blobs.iter().map(|b| self.upload_blob(b, &tip_blobs)))
+        let (uploaded, total) = (AtomicUsize::new(0), novel_blobs.len());
+        let uploaded = &uploaded;
+        if total > 0 {
+            self.report_progress(Progress::Uploading { done: 0, total });
+        }
+        stream::iter(novel_blobs.iter().map(|b| async {
+            self.upload_blob(b, &tip_blobs).await?;
+            let done = uploaded.fetch_add(1, Ordering::Relaxed) + 1;
+            self.report_progress(Progress::Uploading { done, total });
+            Ok::<(), Error>(())
+        }))
             .buffer_unordered(WORKERS)
             .try_collect::<Vec<()>>()
             .await?;

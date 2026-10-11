@@ -35,7 +35,7 @@ pub use error::{Error, Result};
 pub use manifest::{Manifest, ManifestFile};
 pub use remote::Remote;
 pub use repo::{CommitResult, Config, LogEntry, Repo, Status};
-pub use sync::{SyncAction, SyncReport, Syncer};
+pub use sync::{Progress, ProgressFn, SyncAction, SyncReport, Syncer};
 
 /// Lowercase hex SHA-256 of `data`.
 pub fn sha256_hex(data: &[u8]) -> String {
