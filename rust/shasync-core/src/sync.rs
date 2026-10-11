@@ -383,6 +383,24 @@ impl Syncer {
         Ok(Some((target, copies)))
     }
 
+    /// Makes manifest `sha` local (downloading just that one if needed), for
+    /// browsing history older than this repo's first sync.
+    pub async fn fetch_manifest(&self, sha: &str) -> Result<()> {
+        if !self.repo.has_manifest(sha) {
+            self.download_manifest(sha).await?;
+        }
+        Ok(())
+    }
+
+    /// Makes blob `sha` local (an old file version this repo never had, or
+    /// whose local copy `gc` removed).
+    pub async fn fetch_blob(&self, sha: &str) -> Result<()> {
+        if !self.repo.has_object(sha) {
+            self.download_to(&remote_blob_key(sha), self.repo.object_path(sha), sha.to_string()).await?;
+        }
+        Ok(())
+    }
+
     /// Downloads every blob `manifest_sha` references that isn't local.
     /// Returns how many were downloaded.
     pub async fn fetch_blobs_for(&self, manifest_sha: &str) -> Result<usize> {
