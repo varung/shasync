@@ -1306,6 +1306,12 @@ func cmdGC(ctx context.Context, args []string) error {
 		return err
 	}
 
+	return runGC(ctx, s, r, *dryRun)
+}
+
+// runGC deletes local blobs that HEAD doesn't reference and the remote
+// verifiably has.
+func runGC(ctx context.Context, s *Store, r Remote, dryRun bool) error {
 	head, err := s.readHead()
 	if err != nil {
 		return err
@@ -1342,9 +1348,9 @@ func cmdGC(ctx context.Context, args []string) error {
 		return nil
 	}
 
-	// Build remote-known set from push-log cache.
-	cache := s.readPushLogCache()
-	known, _, err := fetchKnownRemoteSHAs(ctx, r, s, cache)
+	// What's really on the remote: a listing, never the push-log (a hint
+	// that can be stale), since this deletes the local copies.
+	known, _, err := seedKnownFromListing(ctx, r)
 	if err != nil {
 		return err
 	}
@@ -1372,7 +1378,7 @@ func cmdGC(ctx context.Context, args []string) error {
 		}
 	}
 
-	if *dryRun {
+	if dryRun {
 		fmt.Printf("would delete %d blob(s), freeing ~%s  (skipping %d not confirmed on remote)\n",
 			len(toDelete), humanBytes(totalBytes), skipped)
 		return nil
@@ -1668,6 +1674,78 @@ func fetchKnownRemoteSHAs(ctx context.Context, r Remote, s *Store, cache *pushLo
 	return known, newCursor, nil
 }
 
+// coveredByRemoteHead is what the current remote HEAD needs (its files and
+// its manifest chain), which its push checked were there. Empty if there's no
+// remote HEAD or its manifest isn't local.
+func coveredByRemoteHead(ctx context.Context, r Remote, s *Store) (map[string]struct{}, error) {
+	covered := make(map[string]struct{})
+	head, err := readRemoteHead(ctx, r)
+	if err != nil || head == "" || !s.hasManifest(head) {
+		return covered, err
+	}
+	hm, err := s.readManifest(head)
+	if err != nil {
+		return nil, err
+	}
+	for _, f := range hm.Files {
+		covered[f.SHA] = struct{}{}
+	}
+	for cur := head; cur != "" && s.hasManifest(cur); {
+		cm, err := s.readManifest(cur)
+		if err != nil {
+			return nil, err
+		}
+		covered[cur] = struct{}{}
+		cur = cm.ParentSHA
+	}
+	return covered, nil
+}
+
+// ensureOnRemote makes sure these blobs/ and manifests/ keys are on the
+// remote: checked one by one (or with a listing when there are many) and
+// uploaded from here if missing. Missing on both sides is an error.
+func ensureOnRemote(ctx context.Context, r Remote, s *Store, cryptKey []byte, keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	var listed map[string]struct{}
+	if len(keys) > 64 {
+		listed = make(map[string]struct{})
+		for _, prefix := range []string{"blobs/", "manifests/"} {
+			ks, err := r.List(ctx, prefix)
+			if err != nil {
+				return fmt.Errorf("list %s: %w", prefix, err)
+			}
+			for _, k := range ks {
+				listed[k] = struct{}{}
+			}
+		}
+	}
+	return parallelFor(ctx, 16, keys, func(ctx context.Context, key string) error {
+		there := false
+		if listed != nil {
+			_, there = listed[key]
+		} else {
+			ok, err := r.Exists(ctx, key)
+			if err != nil {
+				return err
+			}
+			there = ok
+		}
+		if there {
+			return nil
+		}
+		local := s.objectPath(strings.TrimPrefix(key, "blobs/"))
+		if strings.HasPrefix(key, "manifests/") {
+			local = s.manifestPath(strings.TrimPrefix(key, "manifests/"))
+		}
+		if _, err := os.Stat(local); err != nil {
+			return fmt.Errorf("%s is needed by the new HEAD but is neither here nor on the remote", key)
+		}
+		return uploadFile(ctx, r, cryptKey, local, key)
+	})
+}
+
 // uploadManifestChainAndSetHead uploads every blob and manifest referenced by
 // sha's chain that the remote doesn't already have (determined via push-log,
 // not per-object Exists calls), then atomically updates <prefix>/HEAD.
@@ -1701,6 +1779,11 @@ func uploadManifestChainAndSetHead(ctx context.Context, r Remote, s *Store, cryp
 			return err
 		}
 		collect(pm)
+	}
+
+	covered, err := coveredByRemoteHead(ctx, r, s)
+	if err != nil {
+		return err
 	}
 
 	// Build the set of SHAs known to exist on the remote via push-log.
@@ -1749,6 +1832,28 @@ func uploadManifestChainAndSetHead(ctx context.Context, r Remote, s *Store, cryp
 		if err := uploadFile(ctx, r, cryptKey, s.manifestPath(mSha), remoteManifestKey(mSha)); err != nil {
 			return err
 		}
+	}
+
+	// The push-log only saves work; correctness never depends on it. Before
+	// HEAD moves, check what we skipped on its word that the old HEAD didn't
+	// already need: the new HEAD's files and its manifest chain.
+	var unchecked []string
+	for _, f := range m.Files {
+		if _, ok := known[f.SHA]; ok {
+			if _, ok := covered[f.SHA]; !ok {
+				unchecked = append(unchecked, remoteBlobKey(f.SHA))
+			}
+		}
+	}
+	for _, mSha := range manifestsToPush {
+		if _, ok := known[mSha]; ok {
+			if _, ok := covered[mSha]; !ok {
+				unchecked = append(unchecked, remoteManifestKey(mSha))
+			}
+		}
+	}
+	if err := ensureOnRemote(ctx, r, s, cryptKey, unchecked); err != nil {
+		return err
 	}
 
 	if err := writeRemoteHead(ctx, r, sha); err != nil {

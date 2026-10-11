@@ -313,10 +313,8 @@ impl Syncer {
         .map_err(join_err)?
     }
 
-    /// Go's `uploadFile`: read, zstd, encrypt (mandatory), upload.
-    /// Uploads one blob. The push-log doesn't list blobs uploaded before it
-    /// existed, and `gc` deletes local copies of uploaded blobs, so a blob
-    /// missing here is fine as long as the remote has it.
+    /// Uploads one blob the push-log doesn't list. A blob missing here (`gc`
+    /// deleted it) is fine if the remote has it: the push-log is only a hint.
     async fn upload_blob(&self, sha: &str) -> Result<()> {
         let key = remote_blob_key(sha);
         if !self.repo.has_object(sha) {
@@ -328,6 +326,7 @@ impl Syncer {
         self.upload_file(self.repo.object_path(sha), key).await
     }
 
+    /// Go's `uploadFile`: read, zstd, encrypt (mandatory), upload.
     async fn upload_file(&self, local: std::path::PathBuf, remote_key: String) -> Result<()> {
         let key = self.key.clone();
         let data = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
@@ -372,10 +371,16 @@ impl Syncer {
     /// Go's `uploadManifestChainAndSetHead`: upload the blobs and manifests of
     /// `sha`'s local chain that the push-log says the remote lacks (manifests
     /// oldest-first), set remote HEAD, then append a push-log entry.
+    ///
+    /// The push-log only saves work; correctness never depends on it. Before
+    /// HEAD moves, every object a client needs to sync the new HEAD (its
+    /// files and its manifest chain) has been uploaded now, confirmed on the
+    /// remote, or was already needed by the remote HEAD it replaces.
     pub async fn upload_chain_and_set_head(&self, sha: &str) -> Result<SyncAction> {
         let mut chain = vec![sha.to_string()];
         let tip = self.repo.read_manifest(sha)?;
-        let mut blobs: BTreeSet<String> = tip.files.values().map(|f| f.sha.clone()).collect();
+        let tip_blobs: BTreeSet<String> = tip.files.values().map(|f| f.sha.clone()).collect();
+        let mut blobs = tip_blobs.clone();
         let mut p = tip.parent_sha;
         while !p.is_empty() && self.repo.has_manifest(&p) {
             let pm = self.repo.read_manifest(&p)?;
@@ -383,6 +388,7 @@ impl Syncer {
             chain.push(p);
             p = pm.parent_sha;
         }
+        let covered = self.covered_by_remote_head().await?;
 
         let mut cache = PushLogCache::read(&self.repo);
         let (mut known, new_cursor) = self.fetch_known_remote_shas(&cache).await?;
@@ -397,6 +403,13 @@ impl Syncer {
         for m in &novel_manifests {
             self.upload_file(self.repo.manifest_path(m), remote_manifest_key(m)).await?;
         }
+
+        // What we skipped on the push-log's word and the old HEAD didn't need.
+        let unchecked_blobs: Vec<String> =
+            tip_blobs.into_iter().filter(|b| known.contains(b) && !covered.contains(b)).collect();
+        let unchecked_manifests: Vec<String> =
+            chain.iter().filter(|m| known.contains(*m) && !covered.contains(*m)).cloned().collect();
+        self.ensure_on_remote(&unchecked_blobs, &unchecked_manifests).await?;
 
         write_remote_head(self.remote(), sha).await?;
 
@@ -415,6 +428,64 @@ impl Syncer {
             let _ = cache.write(&self.repo);
         }
         Ok(SyncAction::Pushed { head: sha.to_string(), new_blobs: novel_blobs.len(), new_manifests: novel_manifests.len() })
+    }
+
+    /// The blobs and manifests the current remote HEAD needs (its files and
+    /// its manifest chain), which its push checked were there. Empty if
+    /// there's no remote HEAD or its manifest isn't local.
+    async fn covered_by_remote_head(&self) -> Result<HashSet<String>> {
+        let mut covered = HashSet::new();
+        let Some(head) = read_remote_head(self.remote()).await? else { return Ok(covered) };
+        if !self.repo.has_manifest(&head) {
+            return Ok(covered);
+        }
+        covered.extend(self.repo.read_manifest(&head)?.files.into_values().map(|f| f.sha));
+        let mut cur = head;
+        while !cur.is_empty() && self.repo.has_manifest(&cur) {
+            let parent = self.repo.read_manifest(&cur)?.parent_sha;
+            covered.insert(cur);
+            cur = parent;
+        }
+        Ok(covered)
+    }
+
+    /// Makes sure these objects are on the remote: checked one by one (or
+    /// with a listing when there are many), and uploaded from here if
+    /// missing. An object missing on both sides is an error.
+    async fn ensure_on_remote(&self, blobs: &[String], manifests: &[String]) -> Result<()> {
+        let keys: Vec<(String, std::path::PathBuf)> = blobs
+            .iter()
+            .map(|b| (remote_blob_key(b), self.repo.object_path(b)))
+            .chain(manifests.iter().map(|m| (remote_manifest_key(m), self.repo.manifest_path(m))))
+            .collect();
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let listed: Option<HashSet<String>> = if keys.len() > 64 {
+            let mut all: HashSet<String> = self.remote.list("blobs/").await?.into_iter().collect();
+            all.extend(self.remote.list("manifests/").await?);
+            Some(all)
+        } else {
+            None
+        };
+        let listed = &listed;
+        stream::iter(keys.into_iter().map(|(key, local)| async move {
+            let there = match listed {
+                Some(l) => l.contains(&key),
+                None => self.remote.exists(&key).await?,
+            };
+            if there {
+                return Ok(());
+            }
+            if !local.exists() {
+                return Err(Error::Other(format!("{key} is needed by the new HEAD but is neither here nor on the remote")));
+            }
+            self.upload_file(local, key).await
+        }))
+        .buffer_unordered(WORKERS)
+        .try_collect::<Vec<()>>()
+        .await?;
+        Ok(())
     }
 
     /// Go's `fetchKnownRemoteSHAs`: the SHAs listed in push-log entries newer

@@ -553,3 +553,93 @@ func TestRemoteSetClearsPushLogCacheWhenRemoteChanges(t *testing.T) {
 		t.Fatal("cache kept after changing the endpoint")
 	}
 }
+
+// The push-log is only a hint about what the remote holds. These cover the
+// two ways it can be wrong: listing something the remote lacks, and missing
+// something the remote has.
+
+func blobOf(t *testing.T, m machineT, name string) string {
+	t.Helper()
+	head, err := m.s.readHead()
+	if err != nil {
+		t.Fatal(err)
+	}
+	man, err := m.s.readManifest(head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return man.Files[name].SHA
+}
+
+func copyBucket(r *memRemote, keep func(k string) bool) *memRemote {
+	out := &memRemote{objs: map[string][]byte{}}
+	for k, v := range r.objs {
+		if keep(k) {
+			out.objs[k] = v
+		}
+	}
+	return out
+}
+
+// gc deletes local copies, so it must check the remote itself.
+func TestGCKeepsBlobsThePushLogListsButTheRemoteLacks(t *testing.T) {
+	m := newMachine(t, "m")
+	r := &memRemote{objs: map[string][]byte{}}
+	m.put(t, "note.md", "v1\n")
+	m.sync(t, r)
+	v1 := blobOf(t, m, "note.md")
+	m.put(t, "note.md", "v2, longer\n")
+	m.sync(t, r)
+	delete(r.objs, remoteBlobKey(v1))
+	if err := runGC(context.Background(), m.s, r, false); err != nil {
+		t.Fatal(err)
+	}
+	if !m.s.hasObject(v1) {
+		t.Fatal("gc deleted the only copy of a blob the push-log listed but the remote lacked")
+	}
+}
+
+// gc removed a blob the push-log never listed (uploaded before the push-log
+// existed): push must not try to read it from disk.
+func TestPushSkipsGCedBlobsThePushLogNeverListed(t *testing.T) {
+	m := newMachine(t, "m")
+	old := &memRemote{objs: map[string][]byte{}}
+	m.put(t, "note.md", "v1\n")
+	m.sync(t, old)
+	v1 := blobOf(t, m, "note.md")
+	m.put(t, "note.md", "v2, longer\n")
+	m.sync(t, old)
+	r := copyBucket(old, func(k string) bool { return !strings.HasPrefix(k, "push-log/") })
+	r.objs["push-log/00000000000000000001-unrelated"] = []byte("\n")
+	if err := os.Remove(m.s.objectPath(v1)); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Remove(m.s.pushLogCachePath())
+	m.put(t, "note.md", "v3, longer still\n")
+	m.sync(t, r)
+	head, _ := m.s.readHead()
+	if got, _ := readRemoteHead(context.Background(), r); got != head {
+		t.Fatalf("remote HEAD %s, want %s", got, head)
+	}
+}
+
+// A push-log listing a blob the remote lacks must not leave HEAD pointing at
+// a snapshot nobody can download.
+func TestPushChecksWhatTheNewHeadNeeds(t *testing.T) {
+	m := newMachine(t, "m")
+	old := &memRemote{objs: map[string][]byte{}}
+	m.put(t, "note.md", "v1\n")
+	m.sync(t, old)
+	blob := blobOf(t, m, "note.md")
+	r := copyBucket(old, func(k string) bool { return k != remoteBlobKey(blob) && k != remoteHeadKey })
+	m.put(t, "other.md", "new file\n")
+	m.sync(t, r)
+	if _, ok := r.objs[remoteBlobKey(blob)]; !ok {
+		t.Fatal("HEAD points at a snapshot whose blob isn't on the remote")
+	}
+	b := newMachine(t, "b")
+	b.sync(t, r)
+	if got := b.get("note.md"); got != "v1\n" {
+		t.Fatalf("clone got %q", got)
+	}
+}

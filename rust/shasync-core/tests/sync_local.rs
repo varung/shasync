@@ -339,3 +339,34 @@ async fn push_skips_gced_blobs_the_push_log_never_listed() {
     let err = syncer.sync().await.unwrap_err().to_string();
     assert!(err.contains(&v1) && err.contains("neither here nor on the remote"), "{err}");
 }
+
+/// A push-log that lists a blob the remote doesn't have (deleted by hand,
+/// a half-copied bucket) must not let HEAD point at a snapshot nobody can
+/// download: the push checks and uploads it before moving HEAD.
+#[tokio::test(flavor = "multi_thread")]
+async fn push_never_trusts_the_push_log_for_what_head_needs() {
+    let old = MemoryRemote::new();
+    let a = Machine::new(Arc::new(old.clone()));
+    a.put("note.md", "v1\n");
+    a.sync().await;
+    let blob = a.syncer.repo().read_manifest(&a.syncer.repo().head().unwrap().unwrap()).unwrap().files["note.md"].sha.clone();
+
+    // Same push-log, but the blob and HEAD are gone.
+    let mem = MemoryRemote::new();
+    for (k, v) in old.objects() {
+        if k != format!("blobs/{blob}") && k != "HEAD" {
+            mem.insert_raw(&k, v);
+        }
+    }
+    let root = a.root().to_path_buf();
+    let syncer = Syncer::new(Repo::open_exact(&root).unwrap(), Arc::new(mem.clone()), key()).unwrap();
+    put(&root, "other.md", b"new file\n");
+    let rep = syncer.sync().await.unwrap();
+    assert!(matches!(rep.action, SyncAction::Pushed { .. }), "{rep:?}");
+    assert!(mem.objects().contains_key(&format!("blobs/{blob}")), "HEAD points at a snapshot whose blob isn't on the remote");
+
+    // A fresh clone can sync it.
+    let b = Machine::new(Arc::new(mem.clone()));
+    assert!(matches!(b.sync().await, Some(SyncAction::FastForwarded { .. })));
+    assert_eq!(b.get("note.md").unwrap(), "v1\n");
+}
