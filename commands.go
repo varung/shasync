@@ -1719,6 +1719,18 @@ func uploadManifestChainAndSetHead(ctx context.Context, r Remote, s *Store, cryp
 	}
 	sort.Strings(novelBlobs)
 	if err := parallelFor(ctx, 16, novelBlobs, func(ctx context.Context, b string) error {
+		// The push-log doesn't list blobs uploaded before it existed, and gc
+		// deletes local copies of uploaded blobs: fine if the remote has it.
+		if !s.hasObject(b) {
+			ok, err := r.Exists(ctx, remoteBlobKey(b))
+			if err != nil {
+				return err
+			}
+			if ok {
+				return nil
+			}
+			return fmt.Errorf("blob %s is in this repo's history but neither here nor on the remote", b)
+		}
 		return uploadFile(ctx, r, cryptKey, s.objectPath(b), remoteBlobKey(b))
 	}); err != nil {
 		return err

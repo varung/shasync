@@ -314,6 +314,20 @@ impl Syncer {
     }
 
     /// Go's `uploadFile`: read, zstd, encrypt (mandatory), upload.
+    /// Uploads one blob. The push-log doesn't list blobs uploaded before it
+    /// existed, and `gc` deletes local copies of uploaded blobs, so a blob
+    /// missing here is fine as long as the remote has it.
+    async fn upload_blob(&self, sha: &str) -> Result<()> {
+        let key = remote_blob_key(sha);
+        if !self.repo.has_object(sha) {
+            if self.remote.exists(&key).await? {
+                return Ok(());
+            }
+            return Err(Error::Other(format!("blob {sha} is in this repo's history but neither here nor on the remote")));
+        }
+        self.upload_file(self.repo.object_path(sha), key).await
+    }
+
     async fn upload_file(&self, local: std::path::PathBuf, remote_key: String) -> Result<()> {
         let key = self.key.clone();
         let data = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
@@ -374,7 +388,7 @@ impl Syncer {
         let (mut known, new_cursor) = self.fetch_known_remote_shas(&cache).await?;
 
         let novel_blobs: Vec<String> = blobs.into_iter().filter(|b| !known.contains(b)).collect();
-        stream::iter(novel_blobs.iter().map(|b| self.upload_file(self.repo.object_path(b), remote_blob_key(b))))
+        stream::iter(novel_blobs.iter().map(|b| self.upload_blob(b)))
             .buffer_unordered(WORKERS)
             .try_collect::<Vec<()>>()
             .await?;

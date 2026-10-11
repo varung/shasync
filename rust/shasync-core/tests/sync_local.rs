@@ -294,3 +294,48 @@ fn checkout_and_status_roundtrip() {
     assert_eq!(log[0].removed, vec!["a/b/c.txt"]);
     assert_eq!(log[0].modified, vec!["top.txt"]);
 }
+
+/// A remote whose push-log predates some blobs (they were uploaded before
+/// the push-log existed) and a repo whose `gc` removed its copies of them:
+/// pushing must not try to re-upload them from local disk.
+#[tokio::test(flavor = "multi_thread")]
+async fn push_skips_gced_blobs_the_push_log_never_listed() {
+    let old = MemoryRemote::new();
+    let a = Machine::new(Arc::new(old.clone()));
+    a.put("note.md", "v1\n");
+    a.sync().await;
+    let v1 = a.syncer.repo().read_manifest(&a.syncer.repo().head().unwrap().unwrap()).unwrap().files["note.md"].sha.clone();
+    a.put("note.md", "v2, longer\n");
+    a.sync().await;
+
+    // The same objects without the push-log entries that list them.
+    let mem = MemoryRemote::new();
+    for (k, v) in old.objects() {
+        if !k.starts_with("push-log/") {
+            mem.insert_raw(&k, v);
+        }
+    }
+    mem.insert_raw("push-log/00000000000000000001-unrelated", b"\n".to_vec());
+    let root = a.root().to_path_buf();
+    fs::remove_file(a.syncer.repo().object_path(&v1)).unwrap();
+    let _ = fs::remove_file(root.join(".blobs/push-log-cache"));
+
+    let syncer = Syncer::new(Repo::open_exact(&root).unwrap(), Arc::new(mem.clone()), key()).unwrap();
+    put(&root, "note.md", b"v3, longer still\n");
+    let rep = syncer.sync().await.unwrap();
+    assert!(matches!(rep.action, SyncAction::Pushed { .. }), "{rep:?}");
+
+    // A blob gone from both sides is an error, not a silent skip.
+    let mem2 = MemoryRemote::new();
+    for (k, v) in mem.objects() {
+        if !k.starts_with("push-log/") && !k.ends_with(&v1) {
+            mem2.insert_raw(&k, v);
+        }
+    }
+    mem2.insert_raw("push-log/00000000000000000001-unrelated", b"\n".to_vec());
+    let _ = fs::remove_file(root.join(".blobs/push-log-cache"));
+    let syncer = Syncer::new(Repo::open_exact(&root).unwrap(), Arc::new(mem2), key()).unwrap();
+    put(&root, "note.md", b"v4\n");
+    let err = syncer.sync().await.unwrap_err().to_string();
+    assert!(err.contains(&v1) && err.contains("neither here nor on the remote"), "{err}");
+}
