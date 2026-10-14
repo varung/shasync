@@ -90,6 +90,10 @@ impl S3Remote {
         };
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(20))
+            // A connection that dies mid-request (the laptop sleeps, the
+            // phone app is suspended, Wi-Fi changes) would otherwise hang
+            // forever; this is per read, so big downloads are fine.
+            .read_timeout(Duration::from_secs(60))
             .build()
             .map_err(|e| Error::Remote(e.to_string()))?;
         Ok(S3Remote { bucket, creds, prefix: cfg.prefix.trim_matches('/').to_string(), http })

@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 use futures::stream::{self, StreamExt, TryStreamExt};
 
-use crate::crypto::{decode_object, encode_object, is_encrypted, Key, SALT_LENGTH};
+use crate::crypto::{decode_object, encode_object, is_encrypted, open_object, Key, SALT_LENGTH};
+use crate::delta::{self, Delta};
 use crate::error::{Error, Result};
 use crate::merge::auto_merge;
 use crate::remote::{remote_blob_key, remote_manifest_key, Remote, PUSH_LOG_PREFIX, REMOTE_HEAD_KEY, REMOTE_SALT_KEY};
@@ -459,8 +460,51 @@ impl Syncer {
         Ok(total)
     }
 
+    /// Downloads manifest `sha`, stored full (a keyframe) or as a delta from
+    /// one (see [`delta`]); either way it's stored here full, checked
+    /// against its SHA.
     async fn download_manifest(&self, sha: &str) -> Result<()> {
-        self.download_to(&remote_manifest_key(sha), self.repo.manifest_path(sha), sha.to_string()).await
+        let key_name = remote_manifest_key(sha);
+        let data = self.remote.get(&key_name).await?;
+        let key = self.key.clone();
+        let pt = tokio::task::spawn_blocking(move || open_object(&key, &data, &key_name)).await.map_err(join_err)??;
+        if !delta::is_delta(&pt) {
+            let sha = sha.to_string();
+            return self.blocking(move |repo| {
+                let got = crate::sha256_hex(&pt);
+                if got != sha { return Err(Error::ShaMismatch { got, want: sha }); }
+                repo.store_verified(&repo.manifest_path(&sha), &pt)?;
+                repo.add_keyframe(&sha)
+            }).await;
+        }
+        let d = Delta::parse(&pt, sha)?;
+        let base = d.base().to_string();
+        if !self.repo.has_manifest(&base) {
+            // A keyframe is full on the remote: a delta there is an error.
+            self.download_to(&remote_manifest_key(&base), self.repo.manifest_path(&base), base.clone()).await?;
+        }
+        let sha = sha.to_string();
+        self.blocking(move |repo| {
+            let bytes = d.apply(&repo.read_manifest(&base)?, &sha)?;
+            repo.store_verified(&repo.manifest_path(&sha), &bytes)?;
+            repo.add_keyframe(&base)
+        }).await
+    }
+
+    /// Uploads local manifest `sha`, as a delta from a keyframe when that's
+    /// small, else full (and it becomes the keyframe).
+    async fn upload_manifest(&self, sha: &str) -> Result<()> {
+        let (key, s) = (self.key.clone(), sha.to_string());
+        let (data, full) = self.blocking(move |repo| {
+            let (pt, full) = delta::choose(&repo, &s)?;
+            Ok((encode_object(&key, &pt)?, full))
+        }).await?;
+        if !is_encrypted(&data) {
+            return Err(Error::Other(format!("refusing to upload manifest {sha}: encryption produced no SHAS header")));
+        }
+        self.remote.put(&remote_manifest_key(sha), data).await?;
+        if full { self.repo.add_keyframe(sha)?; }
+        Ok(())
     }
 
     /// Go's `downloadAndStore`: fetch, refuse plaintext, decrypt, decompress,
@@ -590,7 +634,7 @@ impl Syncer {
 
         let novel_manifests: Vec<String> = chain.iter().rev().filter(|m| !known.contains(*m)).cloned().collect();
         for m in &novel_manifests {
-            self.upload_file(self.repo.manifest_path(m), remote_manifest_key(m)).await?;
+            self.upload_manifest(m).await?;
         }
 
         // What we skipped on the push-log's word and the old HEAD didn't need.
@@ -670,6 +714,9 @@ impl Syncer {
             }
             if !local.exists() {
                 return Err(Error::LocalEditsDuringSync);
+            }
+            if let Some(m) = key.strip_prefix("manifests/") {
+                return self.upload_manifest(m).await;
             }
             self.upload_file(local, key).await
         }))

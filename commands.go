@@ -1744,6 +1744,9 @@ func ensureOnRemote(ctx context.Context, r Remote, s *Store, cryptKey []byte, ke
 			// the folder. (Chain manifests are always local.)
 			return errLocalEditsDuringSync
 		}
+		if strings.HasPrefix(key, "manifests/") {
+			return uploadManifest(ctx, r, s, cryptKey, strings.TrimPrefix(key, "manifests/"))
+		}
 		return uploadFile(ctx, r, cryptKey, local, key)
 	})
 }
@@ -1854,7 +1857,7 @@ func uploadManifestChainAndSetHead(ctx context.Context, r Remote, s *Store, cryp
 	}
 	// Upload oldest-first so a remote observer never sees a dangling parent.
 	for _, mSha := range novelManifests {
-		if err := uploadFile(ctx, r, cryptKey, s.manifestPath(mSha), remoteManifestKey(mSha)); err != nil {
+		if err := uploadManifest(ctx, r, s, cryptKey, mSha); err != nil {
 			return err
 		}
 	}
@@ -2169,7 +2172,7 @@ func cmdPull(ctx context.Context, args []string) error {
 }
 
 func downloadManifest(ctx context.Context, r Remote, s *Store, cryptKey []byte, sha string) error {
-	return downloadAndStore(ctx, r, cryptKey, remoteManifestKey(sha), s.manifestPath(sha), sha)
+	return downloadManifestObject(ctx, r, s, cryptKey, sha)
 }
 
 func downloadBlob(ctx context.Context, r Remote, s *Store, cryptKey []byte, sha string) error {
@@ -2180,16 +2183,17 @@ func downloadBlob(ctx context.Context, r Remote, s *Store, cryptKey []byte, sha 
 // != nil), and uploads under remoteKey. Caller is responsible for dedup
 // (the push-log cache handles this at a higher level).
 func uploadFile(ctx context.Context, r Remote, cryptKey []byte, localPath, remoteKey string) error {
-	f, err := os.Open(localPath)
+	data, err := os.ReadFile(localPath)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	data, err := io.ReadAll(f)
-	if err != nil {
-		return err
-	}
-	data, err = compressZstd(data)
+	return uploadPlaintext(ctx, r, cryptKey, data, remoteKey)
+}
+
+// uploadPlaintext zstd-compresses data, encrypts it (mandatory) and uploads
+// it under remoteKey.
+func uploadPlaintext(ctx context.Context, r Remote, cryptKey []byte, data []byte, remoteKey string) error {
+	data, err := compressZstd(data)
 	if err != nil {
 		return err
 	}
@@ -2212,38 +2216,48 @@ func uploadFile(ctx context.Context, r Remote, cryptKey []byte, localPath, remot
 // SHAS magic, decompresses if it starts with zstd magic, verifies the
 // plaintext SHA, and writes to dst atomically at mode 0444.
 func downloadAndStore(ctx context.Context, r Remote, cryptKey []byte, remoteKey, dst, sha string) error {
-	rc, err := r.Download(ctx, remoteKey)
+	data, err := downloadPlaintext(ctx, r, cryptKey, remoteKey)
 	if err != nil {
 		return err
-	}
-	defer rc.Close()
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return err
-	}
-	data, err := io.ReadAll(rc)
-	if err != nil {
-		return err
-	}
-	// Remotes are always encrypted; a plaintext object means something wrote
-	// to the bucket without shasync's encryption, so don't trust it.
-	if len(cryptKey) == 0 {
-		return fmt.Errorf("%s: %w", remoteKey, errNoKey)
-	}
-	if !isEncryptedObject(data) {
-		return fmt.Errorf("%s is not encrypted — shasync only accepts encrypted remotes", remoteKey)
-	}
-	data, err = decryptBytes(cryptKey, data)
-	if err != nil {
-		return fmt.Errorf("%s: %w", remoteKey, err)
-	}
-	if isZstd(data) {
-		data, err = decompressZstd(data)
-		if err != nil {
-			return fmt.Errorf("%s: decompress: %w", remoteKey, err)
-		}
 	}
 	if err := verifyPlaintextSHA(data, sha); err != nil {
 		return fmt.Errorf("%s: %w", remoteKey, err)
 	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
 	return writeFileAtomic(dst, data, 0o444)
+}
+
+// downloadPlaintext fetches remoteKey, refuses plaintext objects, decrypts,
+// and decompresses. The caller verifies what it got.
+func downloadPlaintext(ctx context.Context, r Remote, cryptKey []byte, remoteKey string) ([]byte, error) {
+	rc, err := r.Download(ctx, remoteKey)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		return nil, err
+	}
+	// Remotes are always encrypted; a plaintext object means something wrote
+	// to the bucket without shasync's encryption, so don't trust it.
+	if len(cryptKey) == 0 {
+		return nil, fmt.Errorf("%s: %w", remoteKey, errNoKey)
+	}
+	if !isEncryptedObject(data) {
+		return nil, fmt.Errorf("%s is not encrypted — shasync only accepts encrypted remotes", remoteKey)
+	}
+	data, err = decryptBytes(cryptKey, data)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", remoteKey, err)
+	}
+	if isZstd(data) {
+		data, err = decompressZstd(data)
+		if err != nil {
+			return nil, fmt.Errorf("%s: decompress: %w", remoteKey, err)
+		}
+	}
+	return data, nil
 }

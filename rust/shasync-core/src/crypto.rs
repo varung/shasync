@@ -228,16 +228,24 @@ pub fn encode_object(key: &Key, plaintext: &[u8]) -> Result<Vec<u8>> {
 /// starts with the zstd magic, then verify `sha256 == expected_sha`.
 /// `name` is used in error messages (e.g. the remote key).
 pub fn decode_object(key: &Key, data: &[u8], expected_sha: &str, name: &str) -> Result<Vec<u8>> {
+    let pt = open_object(key, data, name)?;
+    let got = sha256_hex(&pt);
+    if got != expected_sha {
+        return Err(Error::ShaMismatch { got, want: expected_sha.to_string() });
+    }
+    Ok(pt)
+}
+
+/// A downloaded object's plaintext, unverified: refuse plaintext, decrypt,
+/// decompress. (A manifest stored as a delta only hashes to its SHA once
+/// rebuilt; see `delta`.)
+pub fn open_object(key: &Key, data: &[u8], name: &str) -> Result<Vec<u8>> {
     if !is_encrypted(data) {
         return Err(Error::NotEncrypted(name.to_string()));
     }
     let mut pt = decrypt(key, data)?;
     if is_zstd(&pt) {
         pt = decompress(&pt)?;
-    }
-    let got = sha256_hex(&pt);
-    if got != expected_sha {
-        return Err(Error::ShaMismatch { got, want: expected_sha.to_string() });
     }
     Ok(pt)
 }

@@ -21,6 +21,7 @@
 //! ```
 
 pub mod crypto;
+pub mod delta;
 pub mod error;
 mod gojson;
 pub mod ignore;

@@ -465,3 +465,68 @@ async fn go_and_rust_sync_through_fake_s3() {
         }
     }
 }
+
+/// Whether the bucket holds manifest `sha` as a delta (not a full listing).
+async fn stored_as_delta(raw: &dyn Remote, key: &shasync_core::Key, sha: &str) -> bool {
+    let data = raw.get(&format!("manifests/{sha}")).await.unwrap();
+    shasync_core::delta::is_delta(&shasync_core::crypto::open_object(key, &data, sha).unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn go_and_rust_read_each_others_delta_manifests() {
+    let s3 = FakeS3::start("deltas");
+    let url = "s3://deltas/proj";
+    let pass = "correct horse battery staple";
+    let cli = GoCli::new(Some(&s3.url));
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b, c) = (tmp.path().join("a-go"), tmp.path().join("b-rust"), tmp.path().join("c-rust"));
+    for d in [&a, &b, &c] { fs::create_dir(d).unwrap(); }
+    // Enough notes that a full listing is worth replacing with deltas.
+    for i in 0..1500 { put(&a, &format!("notes/f{}/n{i}.md", i % 40), format!("note {i}\n").as_bytes()); }
+
+    cli.ok(&a, &["init"], &[]);
+    cli.ok(&a, &["remote", "set", url], &[]);
+    cli.ok(&a, &["key", "set-passphrase"], &[("SHASYNC_PASSPHRASE", pass)]);
+    cli.ok(&a, &["push"], &[]);
+    let raw: Arc<dyn Remote> = Arc::new(s3.remote(url));
+    let first = cli.ok(&a, &["head"], &[]).trim().to_string();
+
+    let repo_b = Repo::init(&b).unwrap();
+    repo_b.set_remote(url, Some(&s3.url), false).unwrap();
+    let key = shasync_core::sync::set_passphrase(&repo_b, raw.as_ref(), pass.as_bytes()).await.unwrap();
+    assert!(!stored_as_delta(raw.as_ref(), &key, &first).await, "the first snapshot is a keyframe");
+    let rb = Syncer::new(repo_b.clone(), raw.clone(), key.clone()).unwrap();
+    rb.pull().await.unwrap();
+
+    // Rust's small change goes up as a delta; Go rebuilds it.
+    put(&b, "notes/f1/n1.md", b"edited in rust\n");
+    fs::remove_file(b.join("notes/f2/n2.md")).unwrap();
+    rb.push().await.unwrap();
+    let h = repo_b.head().unwrap().unwrap();
+    assert!(stored_as_delta(raw.as_ref(), &key, &h).await, "rust's small change is a delta");
+    cli.ok(&a, &["pull"], &[]);
+    assert_eq!(files_of(&a), files_of(&b));
+
+    // Go's small change goes up as a delta; Rust rebuilds it.
+    put(&a, "notes/f3/n3.md", b"edited in go\n");
+    put(&a, "go-new.md", b"new in go\n");
+    cli.ok(&a, &["push"], &[]);
+    let h = cli.ok(&a, &["head"], &[]).trim().to_string();
+    assert!(stored_as_delta(raw.as_ref(), &key, &h).await, "go's small change is a delta");
+    rb.pull().await.unwrap();
+    assert_eq!(files_of(&a), files_of(&b));
+
+    // A fresh Rust folder and a fresh Go folder start from a delta HEAD.
+    let repo_c = Repo::init(&c).unwrap();
+    repo_c.set_remote(url, Some(&s3.url), false).unwrap();
+    let key_c = shasync_core::sync::set_passphrase(&repo_c, raw.as_ref(), pass.as_bytes()).await.unwrap();
+    Syncer::new(repo_c.clone(), raw.clone(), key_c).unwrap().sync().await.unwrap();
+    assert_eq!(files_of(&c), files_of(&a));
+    let d = tmp.path().join("d-go");
+    fs::create_dir(&d).unwrap();
+    cli.ok(&d, &["init"], &[]);
+    cli.ok(&d, &["remote", "set", url], &[]);
+    cli.ok(&d, &["key", "set-passphrase"], &[("SHASYNC_PASSPHRASE", pass)]);
+    cli.ok(&d, &["pull"], &[]);
+    assert_eq!(files_of(&d), files_of(&a));
+}
